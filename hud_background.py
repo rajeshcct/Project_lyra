@@ -1,10 +1,9 @@
 """
 Animated HUD-style background.
 
-Pure QPainter — pulsing concentric rings, a sweeping scanline, and a faint
-dot grid, all drawn in code. No image assets, so it's resolution-independent
-and instantly re-themeable via theme.py's ACCENT color. Runs at ~30fps on a
-QTimer.
+Pure QPainter — a sweeping scanline over a faint dot grid, drawn in code.
+No image assets, so it's resolution-independent and instantly re-themeable
+via theme.py's ACCENT color. Runs at ~30fps on a QTimer.
 
 This is an original composition inspired by sci-fi HUD aesthetics generally
 — it deliberately does not reproduce any specific film/franchise's branded
@@ -12,15 +11,13 @@ interface elements (logos, character names, etc.), since those are someone
 else's IP even in a personal project.
 """
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
+from PySide6.QtCore import Qt, QTimer, QRectF
 from PySide6.QtGui import QPainter, QPen, QColor, QLinearGradient, QPixmap
 from PySide6.QtWidgets import QWidget
 
 from theme import ACCENT, BG_DARK
 
 FPS_MS = 33          # ~30 fps
-RING_COUNT = 4
-RING_CYCLE_SECONDS = 8.0
 SCANLINE_SPEED_PX_PER_SEC = 60
 GRID_STEP = 28
 
@@ -50,12 +47,11 @@ class HudBackground(QWidget):
         painter.fillRect(self.rect(), BG_DARK)
 
         self._draw_grid(painter)
-        self._draw_rings(painter)
         self._draw_scanline(painter)
 
     def _draw_grid(self, painter: QPainter):
-        # The dot grid never moves -- only the rings/scanline animate --
-        # so painting it with hundreds of individual drawPoint() calls on
+        # The dot grid never moves -- only the scanline animates -- so
+        # painting it with hundreds of individual drawPoint() calls on
         # every single 33ms tick was pure waste. Render it once into a
         # pixmap and just blit that from then on (recomputed only if the
         # widget is resized, via resizeEvent above).
@@ -73,22 +69,6 @@ class HudBackground(QWidget):
             gp.end()
             self._grid_cache = pixmap
         painter.drawPixmap(0, 0, self._grid_cache)
-
-    def _draw_rings(self, painter: QPainter):
-        c = ACCENT
-        cx, cy = self.width() / 2, self.height() / 2
-        max_r = max(self.width(), self.height()) * 0.8
-        painter.setBrush(Qt.NoBrush)
-        for i in range(RING_COUNT):
-            phase = (self._t / RING_CYCLE_SECONDS + i / RING_COUNT) % 1.0
-            radius = phase * max_r
-            alpha = int(90 * (1 - phase))
-            if alpha <= 0:
-                continue
-            pen = QPen(QColor(c.red(), c.green(), c.blue(), alpha))
-            pen.setWidth(2)
-            painter.setPen(pen)
-            painter.drawEllipse(QPointF(cx, cy), radius, radius)
 
     def _draw_scanline(self, painter: QPainter):
         c = ACCENT

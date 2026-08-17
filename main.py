@@ -24,6 +24,7 @@ import sys
 
 from PySide6.QtCore import (
     QRect,
+    QTimer,
     QPropertyAnimation,
     QParallelAnimationGroup,
     QEasingCurve,
@@ -59,6 +60,18 @@ class ChatWindow(QWidget):
 
         self._worker = None  # keep a reference so QThread isn't garbage collected mid-run
         self._current_reply_bubble = None  # the bubble currently being grown by a streaming reply
+
+        # Streaming can arrive far faster than the UI can usefully redraw
+        # (some providers push 100+ chunks/sec) -- if each chunk triggered
+        # its own bubble resize + relayout immediately, a fast reply could
+        # flood the event queue faster than the window can drain it, which
+        # is what "not responding" actually was. Buffering chunks and
+        # flushing them to the bubble on a fixed timer instead caps UI
+        # updates at a steady ~25/sec no matter how fast tokens arrive.
+        self._pending_chunk_text = ""
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setInterval(40)
+        self._flush_timer.timeout.connect(self._flush_pending_chunk)
 
         self._build_ui()
 
@@ -170,6 +183,7 @@ class ChatWindow(QWidget):
         self.input_box.clear()
         self._set_busy(True)
         self._current_reply_bubble = None  # next chunk_ready starts a fresh reply bubble
+        self._pending_chunk_text = ""
 
         self._worker = LLMWorker(prompt)
         self._worker.chunk_ready.connect(self._on_chunk)
@@ -178,17 +192,30 @@ class ChatWindow(QWidget):
         self._worker.start()
 
     def _on_chunk(self, chunk: str):
+        # Just buffer here -- _flush_pending_chunk (on the timer) is what
+        # actually touches the bubble/layout, so bursts of chunks collapse
+        # into one UI update per tick instead of one per chunk.
+        self._pending_chunk_text += chunk
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def _flush_pending_chunk(self):
+        if not self._pending_chunk_text:
+            return
+        text, self._pending_chunk_text = self._pending_chunk_text, ""
         if self._current_reply_bubble is None:
-            # First chunk of this reply: start a new bubble seeded with it.
-            self._current_reply_bubble = self._append_line("Lyra", chunk)
+            # First flush of this reply: start a new bubble seeded with it.
+            self._current_reply_bubble = self._append_line("Lyra", text)
         else:
-            # Later chunks: grow the same bubble instead of adding new rows.
-            self._current_reply_bubble.append_text(chunk)
+            # Later flushes: grow the same bubble instead of adding new rows.
+            self._current_reply_bubble.append_text(text)
 
     def _on_error(self, message: str):
         self._append_line("Error", message, is_error=True)
 
     def _on_worker_finished(self):
+        self._flush_timer.stop()
+        self._flush_pending_chunk()  # don't drop whatever hasn't been flushed yet
         self._current_reply_bubble = None  # this reply is done; next one starts fresh
         self._set_busy(False)
         self.input_box.setFocus()
