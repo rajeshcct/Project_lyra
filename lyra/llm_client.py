@@ -15,8 +15,8 @@ Provider *implementations* live in providers/ — see providers/__init__.py
 for how to add a new one without touching this file.
 """
 
-from config import PROVIDER, MODEL_NAME, API_KEY
-from providers import get_provider
+from .config import PROVIDER, MODEL_NAME, API_KEY
+from .providers import get_provider
 
 
 def ask_llm(prompt: str) -> str:

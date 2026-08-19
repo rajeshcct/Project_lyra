@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt, QTimer, QRectF
 from PySide6.QtGui import QPainter, QPen, QColor, QLinearGradient, QPixmap
 from PySide6.QtWidgets import QWidget
 
-from theme import ACCENT, BG_DARK
+from .theme import ACCENT, BG_DARK
 
 FPS_MS = 33          # ~30 fps
 SCANLINE_SPEED_PX_PER_SEC = 60

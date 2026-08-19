@@ -20,9 +20,11 @@ from PySide6.QtWidgets import (
     QLabel,
 )
 
-from theme import ACCENT, TEXT_MAIN, ERROR
+from .theme import ACCENT, TEXT_MAIN, ERROR
 
-MAX_BUBBLE_WIDTH = 1000
+MAX_BUBBLE_WIDTH = 480  # must stay well under the chat window's width -- see the
+                        # note in MessageBubble.__init__ for why this used to be
+                        # 1000 and silently broke streaming replies.
 MIN_BUBBLE_WIDTH = 90
 BUBBLE_H_PADDING = 12 + 12 + 6  # inner.setContentsMargins L+R plus a little breathing room
 
@@ -86,21 +88,27 @@ class MessageBubble(QFrame):
         inner.addWidget(body)
         self._body = body  # kept so append_text() can grow this bubble for streaming replies
 
-        # QLabel.sizeHint(), for a word-wrapped label, is the width needed
-        # to fit the text on ONE line -- exactly the "natural" width we want.
-        # Without this, the frame only had a max-width, so every bubble just
-        # stretched to whatever the layout handed it instead of hugging its
-        # own text, which is why short and long messages looked inconsistent.
-        self._resize_to_content()
-
-    def _resize_to_content(self):
-        natural_width = self._body.sizeHint().width() + BUBBLE_H_PADDING
-        self.setFixedWidth(max(MIN_BUBBLE_WIDTH, min(natural_width, MAX_BUBBLE_WIDTH)))
+        # BUG THIS FIXES: a word-wrapped QLabel's sizeHint() is the width
+        # needed to fit the text on ONE line, unwrapped -- not a wrapped
+        # width. The old code used that value directly to setFixedWidth()
+        # on every streamed chunk, so any reply longer than a few words
+        # requested a bubble 1000s of px wide, got clamped to the old
+        # MAX_BUBBLE_WIDTH (1000px -- wider than the whole 720px window),
+        # and kept re-fighting that oversized layout ~25x/sec as chunks
+        # arrived. That's what "not streaming properly" was: bubbles
+        # hanging off-screen and jittering in width while text streamed in.
+        #
+        # Fix: cap the label itself at MAX_BUBBLE_WIDTH so Qt wraps it
+        # there instead of computing a one-line width. Qt then grows the
+        # bubble naturally (and cheaply) as append_text() calls setText(),
+        # with no manual resize step needed.
+        body.setMaximumWidth(MAX_BUBBLE_WIDTH - BUBBLE_H_PADDING)
+        self.setMaximumWidth(MAX_BUBBLE_WIDTH)
+        self.setMinimumWidth(MIN_BUBBLE_WIDTH)
 
     def append_text(self, more_text: str):
         """Grow this bubble with another streamed chunk of text."""
         self._body.setText(self._body.text() + more_text)
-        self._resize_to_content()
 
 
 def make_row(speaker: str, text: str, role: str):

@@ -13,9 +13,9 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QRectF
 from PySide6.QtGui import QPixmap, QColor, QFont
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
-from theme import ACCENT, BG_DARK, TEXT_MAIN
+from .theme import ACCENT, BG_DARK, TEXT_MAIN
 
-ASSET_PATH = Path(__file__).parent / "assets" / "splash.png"
+ASSET_PATH = Path(__file__).parent.parent.parent / "assets" / "splash.png"
 SPLASH_SIZE = (640, 360)
 FADE_MS = 700
 HOLD_MS = 1400

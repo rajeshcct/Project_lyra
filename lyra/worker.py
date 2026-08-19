@@ -14,7 +14,7 @@ provider abstraction in providers/.
 
 from PySide6.QtCore import QThread, Signal
 
-from llm_client import ask_llm_stream
+from .llm_client import ask_llm_stream
 
 
 class LLMWorker(QThread):

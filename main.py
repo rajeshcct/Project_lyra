@@ -44,12 +44,12 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
 )
 
-from config import PROVIDER
-from worker import LLMWorker
-from theme import QSS, ACCENT
-from splash import SplashScreen
-from hud_background import HudBackground
-from chat_bubble import make_row
+from lyra.config import PROVIDER
+from lyra.worker import LLMWorker
+from lyra.ui.theme import QSS, ACCENT
+from lyra.ui.splash import SplashScreen
+from lyra.ui.hud_background import HudBackground
+from lyra.ui.chat_bubble import make_row
 
 
 class ChatWindow(QWidget):
