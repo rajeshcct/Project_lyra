@@ -1,11 +1,20 @@
 """
-Phase 2 — Minimal Working Chat UI
+Phase 2/3 — Chat UI + Voice
 
 Entry point for the GUI. Wires a bare PySide6 window to Phase 1's
 llm_client.ask_llm function via a background QThread (worker.py), so the
 window never freezes while waiting on the API. Which provider actually
 answers (Groq, Gemini, ...) is whatever LLM_PROVIDER is set to in .env —
 this file doesn't know or care.
+
+Phase 3 adds voice on top of the same text path, never replacing it:
+    mic_worker.py  - QThread wrapper around stt.listen_once()
+    tts_worker.py  - QThread wrapper around tts.speak()
+Clicking the mic button captures one utterance, drops the recognized text
+into the same input box, and calls send_message() exactly as Enter/Send
+would. A reply is spoken aloud only if the turn that produced it started
+from the mic — typing a message never triggers unsolicited speech. Typed
+text remains the permanent fallback the whole way through.
 
 Visuals live in their own modules, same "swap without touching other
 files" principle as providers/:
@@ -17,7 +26,7 @@ Run:
     python main.py
 
 Checkpoint this satisfies: typed text -> LLM reply appears in the window,
-UI never freezes.
+UI never freezes; mic button -> spoken reply, using the same path.
 """
 
 import sys
@@ -46,6 +55,8 @@ from PySide6.QtWidgets import (
 
 from lyra.config import PROVIDER
 from lyra.worker import LLMWorker
+from lyra.mic_worker import MicWorker
+from lyra.tts_worker import TTSWorker
 from lyra.ui.theme import QSS, ACCENT
 from lyra.ui.splash import SplashScreen
 from lyra.ui.hud_background import HudBackground
@@ -55,11 +66,21 @@ from lyra.ui.chat_bubble import make_row
 class ChatWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Lyra — Phase 2 Chat ({PROVIDER})")
+        self.setWindowTitle(f"Lyra — Phase 3 Chat ({PROVIDER})")
         self.resize(720, 560)
 
         self._worker = None  # keep a reference so QThread isn't garbage collected mid-run
         self._current_reply_bubble = None  # the bubble currently being grown by a streaming reply
+
+        # Phase 3 -- voice. Mic input feeds the same send_message() path as
+        # typed text; text stays the permanent fallback (mic is additive,
+        # never a replacement). A reply only gets spoken aloud if the turn
+        # that produced it was voice-triggered -- typing a message never
+        # triggers unsolicited speech.
+        self._mic_worker = None
+        self._tts_worker = None
+        self._voice_turn = False
+        self._reply_text_full = ""  # full (unbuffered) reply text, for TTS once the reply finishes
 
         # Streaming can arrive far faster than the UI can usefully redraw
         # (some providers push 100+ chunks/sec) -- if each chunk triggered
@@ -169,21 +190,36 @@ class ChatWindow(QWidget):
         self.send_button.setGraphicsEffect(send_glow)
         input_row.addWidget(self.send_button)
 
+        # Phase 3 -- mic button. Sits next to Send; text input above it stays
+        # the permanent fallback per the plan.
+        self.mic_button = QPushButton("🎤")
+        self.mic_button.setToolTip("Speak a message")
+        self.mic_button.setFixedWidth(44)
+        self.mic_button.clicked.connect(self.start_listening)
+        mic_glow = QGraphicsDropShadowEffect(self.mic_button)
+        mic_glow.setColor(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 130))
+        mic_glow.setBlurRadius(16)
+        mic_glow.setOffset(0, 0)
+        self.mic_button.setGraphicsEffect(mic_glow)
+        input_row.addWidget(self.mic_button)
+
         layout.addLayout(input_row)
 
         self._set_busy(False)  # sets the initial status-dot color
         self.input_box.setFocus()
 
-    def send_message(self):
+    def send_message(self, voice_triggered: bool = False):
         prompt = self.input_box.text().strip()
         if not prompt:
             return
 
+        self._voice_turn = voice_triggered  # only speak the reply if this turn started by voice
         self._append_line("You", prompt)
         self.input_box.clear()
         self._set_busy(True)
         self._current_reply_bubble = None  # next chunk_ready starts a fresh reply bubble
         self._pending_chunk_text = ""
+        self._reply_text_full = ""
 
         self._worker = LLMWorker(prompt)
         self._worker.chunk_ready.connect(self._on_chunk)
@@ -191,11 +227,41 @@ class ChatWindow(QWidget):
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
 
+    def start_listening(self):
+        """Mic button handler: capture one utterance, then send it as if typed."""
+        if self._mic_worker is not None:
+            return  # already listening -- ignore a repeat click
+
+        self._set_busy(True)
+        self.status_label.setText("Listening...")  # override _set_busy's default "Thinking..."
+
+        self._mic_worker = MicWorker()
+        self._mic_worker.text_ready.connect(self._on_mic_text)
+        self._mic_worker.error_occurred.connect(self._on_mic_error)
+        self._mic_worker.finished.connect(self._on_mic_finished)
+        self._mic_worker.start()
+
+    def _on_mic_text(self, text: str):
+        self.input_box.setText(text)
+        self.send_message(voice_triggered=True)
+
+    def _on_mic_error(self, message: str):
+        self._append_line("Error", message, is_error=True)
+
+    def _on_mic_finished(self):
+        # If recognition succeeded, send_message() already re-armed busy
+        # state for the LLM call that's now running -- only clear busy here
+        # if that never happened (recognition failed or produced nothing).
+        self._mic_worker = None
+        if self._worker is None or not self._worker.isRunning():
+            self._set_busy(False)
+
     def _on_chunk(self, chunk: str):
         # Just buffer here -- _flush_pending_chunk (on the timer) is what
         # actually touches the bubble/layout, so bursts of chunks collapse
         # into one UI update per tick instead of one per chunk.
         self._pending_chunk_text += chunk
+        self._reply_text_full += chunk  # kept unbuffered, in full, for TTS once the reply ends
         if not self._flush_timer.isActive():
             self._flush_timer.start()
 
@@ -217,12 +283,36 @@ class ChatWindow(QWidget):
         self._flush_timer.stop()
         self._flush_pending_chunk()  # don't drop whatever hasn't been flushed yet
         self._current_reply_bubble = None  # this reply is done; next one starts fresh
+
+        if self._voice_turn and self._reply_text_full.strip():
+            self._speak_reply(self._reply_text_full)
+        else:
+            self._set_busy(False)
+            self.input_box.setFocus()
+        self._voice_turn = False
+
+    def _speak_reply(self, text: str):
+        self.status_label.setText("Speaking...")
+        self._tts_worker = TTSWorker(text)
+        self._tts_worker.error_occurred.connect(self._on_tts_error)
+        self._tts_worker.finished.connect(self._on_tts_finished)
+        self._tts_worker.start()
+
+    def _on_tts_error(self, message: str):
+        self._append_line("Error", message, is_error=True)
+
+    def _on_tts_finished(self):
+        self._tts_worker = None
         self._set_busy(False)
         self.input_box.setFocus()
 
     def _set_busy(self, busy: bool):
         self.input_box.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
+        self.mic_button.setEnabled(not busy)
+        # _speak_reply() overrides this to "Speaking..." right after busy is
+        # set True for a voice turn's reply -- that happens after this call
+        # returns, so it isn't clobbered here.
         self.status_label.setText("Thinking..." if busy else "")
         dot_color = "#fbbf24" if busy else ACCENT.name()  # amber while thinking, cyan when idle
         self.status_dot.setStyleSheet(f"color: {dot_color};")
