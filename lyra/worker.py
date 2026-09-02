@@ -14,7 +14,7 @@ provider abstraction in providers/.
 
 from PySide6.QtCore import QThread, Signal
 
-from .llm_client import ask_llm_stream
+from .llm_client import ask_llm_stream, ask_llm_with_tools
 
 
 class LLMWorker(QThread):
@@ -35,4 +35,44 @@ class LLMWorker(QThread):
             self.error_occurred.emit(str(e))
         except Exception as e:
             # belt-and-suspenders — never let the thread die silently
+            self.error_occurred.emit(f"Unexpected error: {e}")
+
+
+class ToolWorker(QThread):
+    """
+    Phase 4 — background thread for a tool-enabled LLM call.
+
+    Same off-the-GUI-thread reasoning as LLMWorker, but wraps
+    llm_client.ask_llm_with_tools instead of ask_llm_stream. Tool-calling
+    can't be streamed token-by-token the way a plain reply can (the model
+    has to finish deciding whether to call a tool, the tool has to run, and
+    only then does a final answer exist — see LLMProvider.ask_with_tools's
+    docstring), so instead of chunk_ready this emits:
+
+      - tool_event, once per tool call/result/error, live as they happen
+        (drives the UI's reasoning-trace panel while the request is still
+        in flight instead of leaving the user staring at a blank wait)
+      - reply_ready, once, with the complete final answer text
+
+    tool_event is emitted from this thread; Qt queues the delivery to the
+    connected slot on the main thread automatically (default AutoConnection
+    behaves as QueuedConnection across threads), so no manual thread-safety
+    handling is needed on the receiving end in main.py.
+    """
+
+    tool_event = Signal(dict)
+    reply_ready = Signal(str)
+    error_occurred = Signal(str)
+
+    def __init__(self, prompt: str, parent=None):
+        super().__init__(parent)
+        self._prompt = prompt
+
+    def run(self):
+        try:
+            reply = ask_llm_with_tools(self._prompt, on_tool_event=self.tool_event.emit)
+            self.reply_ready.emit(reply)
+        except RuntimeError as e:
+            self.error_occurred.emit(str(e))
+        except Exception as e:
             self.error_occurred.emit(f"Unexpected error: {e}")

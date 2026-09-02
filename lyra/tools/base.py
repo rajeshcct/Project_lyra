@@ -15,7 +15,7 @@ register_tool() on import — nothing outside tools/ needs to change to add
 one.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
@@ -32,6 +32,14 @@ class ToolSpec:
     # return a string result, and raise RuntimeError (never let a raw
     # exception escape) on failure — same contract as LLMProvider.ask().
     func: Callable[..., str]
+    # Security rule #3 from the plan: sensitive actions need human-triggered
+    # confirmation, not silent auto-execution. No Phase 4 tool needs this
+    # (calculator is harmless), but the flag exists now so it's a fixed
+    # property of the tool contract rather than something bolted on when
+    # the first OS-touching tool shows up in a later phase. Every provider's
+    # ask_with_tools() checks this before running a tool's func — see the
+    # guard in groq_provider.py / gemini_provider.py.
+    requires_confirmation: bool = field(default=False)
 
 
 # Security rule #1 from the plan's Security Considerations section: tool

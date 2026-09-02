@@ -1,5 +1,5 @@
 """
-Phase 2/3 — Chat UI + Voice
+Phase 2/3/4 — Chat UI + Voice + Tools
 
 Entry point for the GUI. Wires a bare PySide6 window to Phase 1's
 llm_client.ask_llm function via a background QThread (worker.py), so the
@@ -16,24 +16,33 @@ would. A reply is spoken aloud only if the turn that produced it started
 from the mic — typing a message never triggers unsolicited speech. Typed
 text remains the permanent fallback the whole way through.
 
+Phase 4 adds tool-calling on top of the same send_message() path: every
+turn now goes through worker.py's ToolWorker (lyra/llm_client.py's
+ask_llm_with_tools), which gives the model every tool registered in
+lyra/tools/ via its native function-calling mechanism. Tool calls/results
+stream live into the reasoning-trace panel (lyra/ui/trace_panel.py) while
+a turn is in flight, then the final answer appears as a normal bubble.
+
 Visuals live in their own modules, same "swap without touching other
 files" principle as providers/:
     theme.py           - color palette + stylesheet (QSS)
     splash.py           - startup splash screen (assets/splash.png, fade-in)
-    hud_background.py    - animated background painted behind the chat UI
+    hud_background.py    - static HUD background painted behind the chat UI
+                            (grid pattern only — no per-frame animation, kept light on CPU)
 
 Run:
     python main.py
 
 Checkpoint this satisfies: typed text -> LLM reply appears in the window,
-UI never freezes; mic button -> spoken reply, using the same path.
+UI never freezes; mic button -> spoken reply, using the same path; asking
+for a calculation -> the reasoning-trace panel shows the calculator being
+called and its result before the final answer appears.
 """
 
 import sys
 
 from PySide6.QtCore import (
     QRect,
-    QTimer,
     QPropertyAnimation,
     QParallelAnimationGroup,
     QEasingCurve,
@@ -54,23 +63,23 @@ from PySide6.QtWidgets import (
 )
 
 from lyra.config import PROVIDER
-from lyra.worker import LLMWorker
+from lyra.worker import ToolWorker
 from lyra.mic_worker import MicWorker
 from lyra.tts_worker import TTSWorker
 from lyra.ui.theme import QSS, ACCENT
 from lyra.ui.splash import SplashScreen
 from lyra.ui.hud_background import HudBackground
 from lyra.ui.chat_bubble import make_row
+from lyra.ui.trace_panel import ReasoningTracePanel
 
 
 class ChatWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Lyra — Phase 3 Chat ({PROVIDER})")
-        self.resize(720, 560)
+        self.setWindowTitle(f"Lyra — Phase 4 Chat ({PROVIDER})")
+        self.resize(720, 620)
 
         self._worker = None  # keep a reference so QThread isn't garbage collected mid-run
-        self._current_reply_bubble = None  # the bubble currently being grown by a streaming reply
 
         # Phase 3 -- voice. Mic input feeds the same send_message() path as
         # typed text; text stays the permanent fallback (mic is additive,
@@ -80,24 +89,12 @@ class ChatWindow(QWidget):
         self._mic_worker = None
         self._tts_worker = None
         self._voice_turn = False
-        self._reply_text_full = ""  # full (unbuffered) reply text, for TTS once the reply finishes
-
-        # Streaming can arrive far faster than the UI can usefully redraw
-        # (some providers push 100+ chunks/sec) -- if each chunk triggered
-        # its own bubble resize + relayout immediately, a fast reply could
-        # flood the event queue faster than the window can drain it, which
-        # is what "not responding" actually was. Buffering chunks and
-        # flushing them to the bubble on a fixed timer instead caps UI
-        # updates at a steady ~25/sec no matter how fast tokens arrive.
-        self._pending_chunk_text = ""
-        self._flush_timer = QTimer(self)
-        self._flush_timer.setInterval(40)
-        self._flush_timer.timeout.connect(self._flush_pending_chunk)
+        self._reply_text_full = ""  # last reply's full text, for TTS once it finishes
 
         self._build_ui()
 
     def _build_ui(self):
-        # Layer 0: animated HUD background (hud_background.py).
+        # Layer 0: static HUD background (hud_background.py).
         # Layer 1: the actual chat UI, on a transparent widget so the
         # background shows through everywhere except the panels that
         # have their own semi-opaque QSS background (transcript, input).
@@ -172,6 +169,13 @@ class ChatWindow(QWidget):
             lambda _min, mx: self.transcript_scroll.verticalScrollBar().setValue(mx)
         )
 
+        # Phase 4 -- reasoning-trace panel: shows tool calls/results live
+        # while a tool-enabled request is in flight. Hidden until the first
+        # tool event of a turn (see ReasoningTracePanel), so it costs no
+        # visual space on ordinary replies that never call a tool.
+        self.trace_panel = ReasoningTracePanel()
+        layout.addWidget(self.trace_panel)
+
         input_row = QHBoxLayout()
 
         # Text input is the permanent fallback (Phase 3 adds voice on top of
@@ -217,12 +221,19 @@ class ChatWindow(QWidget):
         self._append_line("You", prompt)
         self.input_box.clear()
         self._set_busy(True)
-        self._current_reply_bubble = None  # next chunk_ready starts a fresh reply bubble
-        self._pending_chunk_text = ""
         self._reply_text_full = ""
+        self.trace_panel.clear()  # drop the previous turn's tool trace, if any
 
-        self._worker = LLMWorker(prompt)
-        self._worker.chunk_ready.connect(self._on_chunk)
+        # Phase 4: every turn goes through the tool-enabled path. Tool
+        # calling can't be streamed the way a plain reply can (the model
+        # has to finish deciding whether to call a tool before any final
+        # answer text exists at all -- see ToolWorker's docstring), so the
+        # reply arrives whole via reply_ready instead of piece-by-piece via
+        # chunk_ready; the trace panel is what keeps the wait from feeling
+        # like dead air on turns that actually use a tool.
+        self._worker = ToolWorker(prompt)
+        self._worker.tool_event.connect(self.trace_panel.add_event)
+        self._worker.reply_ready.connect(self._on_reply_ready)
         self._worker.error_occurred.connect(self._on_error)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
@@ -256,34 +267,16 @@ class ChatWindow(QWidget):
         if self._worker is None or not self._worker.isRunning():
             self._set_busy(False)
 
-    def _on_chunk(self, chunk: str):
-        # Just buffer here -- _flush_pending_chunk (on the timer) is what
-        # actually touches the bubble/layout, so bursts of chunks collapse
-        # into one UI update per tick instead of one per chunk.
-        self._pending_chunk_text += chunk
-        self._reply_text_full += chunk  # kept unbuffered, in full, for TTS once the reply ends
-        if not self._flush_timer.isActive():
-            self._flush_timer.start()
-
-    def _flush_pending_chunk(self):
-        if not self._pending_chunk_text:
-            return
-        text, self._pending_chunk_text = self._pending_chunk_text, ""
-        if self._current_reply_bubble is None:
-            # First flush of this reply: start a new bubble seeded with it.
-            self._current_reply_bubble = self._append_line("Lyra", text)
-        else:
-            # Later flushes: grow the same bubble instead of adding new rows.
-            self._current_reply_bubble.append_text(text)
+    def _on_reply_ready(self, text: str):
+        # Phase 4's tool-enabled replies arrive whole (see ToolWorker) --
+        # no streaming bubble to grow, just append the finished answer.
+        self._reply_text_full = text
+        self._append_line("Lyra", text)
 
     def _on_error(self, message: str):
         self._append_line("Error", message, is_error=True)
 
     def _on_worker_finished(self):
-        self._flush_timer.stop()
-        self._flush_pending_chunk()  # don't drop whatever hasn't been flushed yet
-        self._current_reply_bubble = None  # this reply is done; next one starts fresh
-
         if self._voice_turn and self._reply_text_full.strip():
             self._speak_reply(self._reply_text_full)
         else:

@@ -1,8 +1,9 @@
-# Lyra — Setup & Phases 1–3
+# Lyra — Setup & Phases 1–4
 
-Status: **Phase 1 (bare LLM chat), Phase 2 (PySide6 chat UI), and Phase 3
-(voice + personal memory) done.**
-Phase 4+ (tool-calling framework, real tools) not started yet.
+Status: **Phase 1 (bare LLM chat), Phase 2 (PySide6 chat UI), Phase 3
+(voice + personal memory), and Phase 4 (tool-calling framework +
+reasoning-trace panel) done.**
+Phase 5+ (more tools, personal-memory refinement) not started yet.
 
 ---
 
@@ -59,7 +60,7 @@ python test_llm.py
 Type a message, press Enter, get a reply. Type `quit` to exit. This proves
 the API key and the LLM call work before anything GUI-related is involved.
 
-## 4. Run the app (Phase 2 UI + Phase 3 voice)
+## 4. Run the app (Phase 2 UI + Phase 3 voice + Phase 4 tools)
 
 ```bat
 venv\Scripts\activate
@@ -84,6 +85,14 @@ python main.py
   sent to the LLM, so it can address you by name without you repeating it.
   Every message either side sends is also logged to that same database's
   `chat_history` table, tagged with a per-run session id.
+- Ask it a calculation ("what's 47 * 89?") and it calls the built-in
+  `calculator` tool instead of guessing the answer itself. A **reasoning
+  trace panel** appears above the input box while the request is in
+  flight, showing the tool being called and its result live, before the
+  final answer is added to the transcript as a normal reply. Every turn
+  goes through this tool-enabled path now, so ordinary questions still
+  work exactly as before — the model just doesn't happen to call a tool
+  for those, and the panel stays hidden.
 
 ---
 
@@ -95,15 +104,15 @@ Project_lyra/
 ├── .env.example               # template, safe to commit
 ├── .gitignore
 ├── requirements.txt
-├── main.py                    # Phase 2/3: PySide6 window, entry point
+├── main.py                    # Phase 2/3/4: PySide6 window, entry point
 ├── lyra_memory.db              # Phase 3: SQLite db (users, chat_history) — gitignored, created on first run
 ├── assets/
 │   └── splash.png              # your own startup splash image (see below)
 └── lyra/                      # the actual application package
     ├── __init__.py
     ├── config.py                # picks provider + model from .env (LLM_PROVIDER)
-    ├── llm_client.py             # Phase 1: ask_llm / ask_llm_stream, no GUI dependency
-    ├── worker.py                  # Phase 2: QThread wrapper around ask_llm_stream
+    ├── llm_client.py             # Phase 1/4: ask_llm / ask_llm_stream / ask_llm_with_tools
+    ├── worker.py                  # Phase 2/4: QThread wrappers (LLMWorker, ToolWorker)
     ├── stt.py                      # Phase 3: listen_once() — mic capture + speech recognition
     ├── tts.py                       # Phase 3: speak() — OS text-to-speech via pyttsx3
     ├── mic_worker.py                 # Phase 3: QThread wrapper around stt.listen_once
@@ -111,15 +120,21 @@ Project_lyra/
     ├── memory.py                       # Phase 3: SQLite users/chat_history + name-extraction + memory prefix
     ├── providers/                # one file per LLM backend, common interface
     │   ├── __init__.py            # auto-discovers & registers provider modules
-    │   ├── base.py                 # LLMProvider abstract base class
+    │   ├── base.py                 # LLMProvider abstract base class (ask/ask_stream/ask_with_tools)
     │   ├── registry.py              # name -> class lookup used by get_provider()
-    │   ├── groq_provider.py          # GroqProvider(LLMProvider)
-    │   └── gemini_provider.py        # GeminiProvider(LLMProvider)
+    │   ├── groq_provider.py          # GroqProvider(LLMProvider) — OpenAI-style tool calling
+    │   └── gemini_provider.py        # GeminiProvider(LLMProvider) — native function calling
+    ├── tools/                    # Phase 4: tool-calling framework, one file per tool
+    │   ├── __init__.py            # auto-discovers & registers tool modules
+    │   ├── base.py                 # ToolSpec dataclass + TOOL_SAFETY_SYSTEM_PROMPT
+    │   ├── registry.py              # name -> ToolSpec lookup used by ask_with_tools()
+    │   └── calculator_tool.py        # dummy tool that proves the loop end-to-end
     └── ui/                        # visual concerns, one file each
         ├── theme.py                # color palette + stylesheet (QSS), one accent color
         ├── splash.py                # startup splash screen: fades in assets/splash.png
-        ├── hud_background.py         # animated HUD background (QPainter, no image needed)
-        └── chat_bubble.py             # per-message bubble widget (rounded, role-colored)
+        ├── hud_background.py         # static HUD grid background (QPainter, no animation — see Notes)
+        ├── chat_bubble.py             # per-message bubble widget (rounded, role-colored)
+        └── trace_panel.py             # Phase 4: live tool-call/result log above the input box
 ```
 
 `llm_client.py` has zero PySide6 import and zero provider-SDK import — it's
@@ -172,6 +187,12 @@ plain dark splash instead of erroring out.
   conservative so casual sentences like "I'm fine" never get misread as a
   name. Phase 5's "personal memory refinement" is where this is meant to
   get smarter (preferences, the rolling-summary context pattern).
+- `hud_background.py` originally animated a sweeping scanline via a
+  ~30fps `QTimer`, repainting the whole window continuously even when
+  totally idle. That constant background CPU draw turned out to be the
+  main source of the app feeling heavy, so the timer and the scanline are
+  gone — the HUD grid is now rendered once into a cached pixmap and just
+  sits there. Same visual language, no per-frame cost.
 - `users` is a single row (id=1) — this is a single-user desktop app, not
   multi-account. `chat_history` is tagged with a `session_id` generated
   once per process run, ready for Phase 5's sliding-window + summary logic
@@ -187,11 +208,36 @@ compromised — rotate it at https://console.groq.com/keys and put only
 `your_groq_api_key_here`-style placeholders in `.env.example` going
 forward. Real keys belong in `.env` only, which stays out of git.
 
-## What's next (Phase 4)
+## Phase 4 notes
 
-Tool-calling framework wired to Gemini's native function calling (a dummy
-calculator tool first, to prove the loop), plus the reasoning-trace panel
-in the UI. See the plan doc's Security Considerations section — three
-rules (tool results are data not instructions, no raw `run_command`, human-
-triggered confirmation for sensitive actions) need to be built into the
-framework from day one, not patched in later.
+Tool-calling is wired to both providers' native function-calling
+mechanisms (Gemini's `FunctionDeclaration`/manual execution, Groq's
+OpenAI-style `tools`/`tool_choice`), proven end-to-end with a dummy
+`calculator` tool. All three of the plan's Security Considerations rules
+are built into the framework itself, not left for a later phase to retrofit:
+
+1. **Tool results are data, not instructions** — `tools/base.py`'s
+   `TOOL_SAFETY_SYSTEM_PROMPT` is sent as an actual system-level
+   instruction on every tool-enabled call.
+2. **No raw `run_command`** — `calculator_tool.py` evaluates via a
+   restricted AST walk, not `eval()`; every future tool is expected to
+   follow the same "fixed function, fixed safe arguments" shape.
+3. **Human-triggered confirmation for sensitive actions** —
+   `ToolSpec.requires_confirmation` exists now (default `False`); both
+   providers refuse to auto-run a tool with it set to `True` rather than
+   executing it silently. No Phase 4 tool sets it yet — an actual
+   confirmation dialog is Phase 5+ work, once there's a tool that needs one.
+
+Tool calls/results show up live in the UI via the reasoning-trace panel
+(`lyra/ui/trace_panel.py`), driven by `ToolWorker`'s `tool_event` signal
+(`worker.py`). Every chat turn now goes through the tool-enabled path
+(`ask_llm_with_tools`); replies no longer stream token-by-token the way
+Phase 2/3's did, since the model has to finish deciding whether to call a
+tool before any final answer text exists.
+
+## What's next (Phase 5)
+
+Real tools beyond the dummy calculator (weather, web search, reminders —
+see `tools/__init__.py`'s docstring for how self-contained adding one is),
+and personal-memory refinement (preferences, the rolling-summary context
+pattern) on top of Phase 3's name-only memory.

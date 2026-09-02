@@ -155,14 +155,32 @@ class GroqProvider(LLMProvider):
                     on_tool_event({"type": "tool_call", "name": tool_name, "args": args})
                 try:
                     tool = get_tool(tool_name)
-                    result_text = tool.func(**args)
                 except Exception as e:
                     result_text = f"Error: {e}"
                     if on_tool_event:
                         on_tool_event({"type": "tool_error", "name": tool_name, "error": str(e)})
                 else:
-                    if on_tool_event:
-                        on_tool_event({"type": "tool_result", "name": tool_name, "result": result_text})
+                    # Security rule #3: a sensitive tool never runs itself
+                    # just because the model asked for it. Phase 4 has no
+                    # confirmation UI yet, so the safe default is to refuse
+                    # and say so, rather than silently executing.
+                    if tool.requires_confirmation:
+                        result_text = (
+                            f"Tool '{tool_name}' requires user confirmation before "
+                            "it can run, which isn't wired up yet — it was not executed."
+                        )
+                        if on_tool_event:
+                            on_tool_event({"type": "tool_blocked", "name": tool_name, "args": args})
+                    else:
+                        try:
+                            result_text = tool.func(**args)
+                        except Exception as e:
+                            result_text = f"Error: {e}"
+                            if on_tool_event:
+                                on_tool_event({"type": "tool_error", "name": tool_name, "error": str(e)})
+                        else:
+                            if on_tool_event:
+                                on_tool_event({"type": "tool_result", "name": tool_name, "result": result_text})
 
             messages.append(
                 {
