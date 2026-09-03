@@ -26,12 +26,21 @@ PROVIDERS = {
     "groq": {
         "api_key_env": "GROQ_API_KEY",
         # llama-3.3-70b-versatile was announced deprecated by Groq on
-        # 2026-06-17; openai/gpt-oss-120b is their recommended replacement
-        # (faster + similar quality). Swap to "openai/gpt-oss-20b" for a
-        # cheaper/faster-but-lighter option.
-        "model": "openai/gpt-oss-120b",
+        # 2026-06-17; compound-beta is Groq's recommended model for
+        # tool/function calling. Falls back cleanly for non-tool turns.
+        "model": "openai/gpt-oss-20b",
     },
 }
+
+# Phase 6 — multi-step tool chains: how many rounds of "model asks for a
+# tool -> Lyra runs it -> model asks again" are allowed before Lyra stops
+# offering tools and forces a text-only final answer. Keeps a model that
+# keeps chaining calls (or a genuinely gnarly multi-tool task) from hanging
+# the app forever. Override via .env: MAX_TOOL_ROUNDS=8
+try:
+    MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "5"))
+except ValueError:
+    MAX_TOOL_ROUNDS = 5
 
 if PROVIDER not in PROVIDERS:
     raise RuntimeError(

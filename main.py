@@ -21,7 +21,9 @@ turn now goes through worker.py's ToolWorker (lyra/llm_client.py's
 ask_llm_with_tools), which gives the model every tool registered in
 lyra/tools/ via its native function-calling mechanism. Tool calls/results
 stream live into the reasoning-trace panel (lyra/ui/trace_panel.py) while
-a turn is in flight, then the final answer appears as a normal bubble.
+a turn is in flight, and the final answer itself streams in token-by-token
+into its own bubble via ToolWorker.chunk_ready, exactly like the plain
+non-tool path -- only the tool-decision step has no text to stream.
 
 Visuals live in their own modules, same "swap without touching other
 files" principle as providers/:
@@ -39,10 +41,13 @@ for a calculation -> the reasoning-trace panel shows the calculator being
 called and its result before the final answer appears.
 """
 
+import re
 import sys
+from collections import deque
 
 from PySide6.QtCore import (
     QRect,
+    QTimer,
     QPropertyAnimation,
     QParallelAnimationGroup,
     QEasingCurve,
@@ -89,7 +94,21 @@ class ChatWindow(QWidget):
         self._mic_worker = None
         self._tts_worker = None
         self._voice_turn = False
+        self._hands_free = False  # True after mic button is toggled on -- keeps re-listening
         self._reply_text_full = ""  # last reply's full text, for TTS once it finishes
+        self._reply_bubble = None  # bubble the current turn's streamed reply is being written into
+
+        # Word-by-word reveal: raw provider chunks arrive in irregular,
+        # sometimes-multi-word bursts (network-dependent), which is what
+        # made streaming feel fast/jumpy. Chunks are buffered here and
+        # released one word at a time on a fixed timer instead, so display
+        # speed is controlled and readable regardless of how the chunks
+        # actually arrive over the wire.
+        self._stream_leftover = ""  # partial word at the end of the buffer, not yet a whole word
+        self._word_queue = deque()
+        self._reveal_timer = QTimer(self)
+        self._reveal_timer.setInterval(100)  # ms between words -- raise/lower to slow/speed up
+        self._reveal_timer.timeout.connect(self._reveal_next_word)
 
         self._build_ui()
 
@@ -197,15 +216,26 @@ class ChatWindow(QWidget):
         # Phase 3 -- mic button. Sits next to Send; text input above it stays
         # the permanent fallback per the plan.
         self.mic_button = QPushButton("🎤")
-        self.mic_button.setToolTip("Speak a message")
+        self.mic_button.setToolTip("Toggle hands-free listening (no need to click each turn)")
         self.mic_button.setFixedWidth(44)
-        self.mic_button.clicked.connect(self.start_listening)
+        self.mic_button.setCheckable(True)
+        self.mic_button.clicked.connect(self._toggle_hands_free)
         mic_glow = QGraphicsDropShadowEffect(self.mic_button)
         mic_glow.setColor(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 130))
         mic_glow.setBlurRadius(16)
         mic_glow.setOffset(0, 0)
         self.mic_button.setGraphicsEffect(mic_glow)
         input_row.addWidget(self.mic_button)
+
+        # Stop button: only meaningful while a request is in flight, so it
+        # starts hidden and _set_busy() toggles its visibility. Cancels the
+        # in-flight ToolWorker cooperatively (see ToolWorker.cancel) rather
+        # than killing the thread outright.
+        self.stop_button = QPushButton("■ Stop")
+        self.stop_button.setToolTip("Cancel the current request")
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+        self.stop_button.hide()
+        input_row.addWidget(self.stop_button)
 
         layout.addLayout(input_row)
 
@@ -222,24 +252,43 @@ class ChatWindow(QWidget):
         self.input_box.clear()
         self._set_busy(True)
         self._reply_text_full = ""
+        self._reply_bubble = None  # created lazily by _on_chunk_ready once the first chunk lands
+        self._stream_leftover = ""
+        self._word_queue.clear()
+        self._reveal_timer.stop()
         self.trace_panel.clear()  # drop the previous turn's tool trace, if any
 
-        # Phase 4: every turn goes through the tool-enabled path. Tool
-        # calling can't be streamed the way a plain reply can (the model
-        # has to finish deciding whether to call a tool before any final
-        # answer text exists at all -- see ToolWorker's docstring), so the
-        # reply arrives whole via reply_ready instead of piece-by-piece via
-        # chunk_ready; the trace panel is what keeps the wait from feeling
-        # like dead air on turns that actually use a tool.
+        # Phase 4: every turn goes through the tool-enabled path. The
+        # tool-decision step itself can't be streamed (the model has to
+        # finish deciding whether to call a tool before any answer text
+        # exists at all -- see ToolWorker's docstring), so the trace panel
+        # is what keeps that part from feeling like dead air. The actual
+        # answer text -- direct reply or the follow-up after a tool runs --
+        # streams in via chunk_ready and grows the bubble live, same as the
+        # plain non-tool path.
         self._worker = ToolWorker(prompt)
         self._worker.tool_event.connect(self.trace_panel.add_event)
+        self._worker.chunk_ready.connect(self._on_chunk_ready)
         self._worker.reply_ready.connect(self._on_reply_ready)
         self._worker.error_occurred.connect(self._on_error)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
 
+    def _toggle_hands_free(self, checked: bool):
+        """Mic button now toggles a mode rather than firing one listen. When
+        turned on, start_listening() re-arms itself automatically after every
+        reply (text and, if spoken, TTS) finishes -- so the user never has to
+        click the mic again mid-conversation. Turning it off just stops the
+        auto-restart; any listen already in flight still finishes normally."""
+        self._hands_free = checked
+        self.mic_button.setText("🔴" if checked else "🎤")
+        if checked and self._mic_worker is None and self._worker is None and self._tts_worker is None:
+            self.start_listening()
+
     def start_listening(self):
-        """Mic button handler: capture one utterance, then send it as if typed."""
+        """Capture one utterance, then send it as if typed. Called once per
+        turn; when hands-free mode is on, it re-arms itself automatically
+        (see _on_mic_finished / _on_tts_finished / _on_worker_finished)."""
         if self._mic_worker is not None:
             return  # already listening -- ignore a repeat click
 
@@ -257,7 +306,14 @@ class ChatWindow(QWidget):
         self.send_message(voice_triggered=True)
 
     def _on_mic_error(self, message: str):
-        self._append_line("Error", message, is_error=True)
+        # "Didn't hear anything" is the normal outcome of an open hands-free
+        # mic during silence -- don't spam it into the transcript, just keep
+        # listening. Genuine errors (no mic hardware, no permission) still
+        # get logged so the user isn't stuck in a silent retry loop.
+        if self._hands_free and message.startswith("Didn't hear anything"):
+            pass
+        else:
+            self._append_line("Error", message, is_error=True)
 
     def _on_mic_finished(self):
         # If recognition succeeded, send_message() already re-armed busy
@@ -266,12 +322,57 @@ class ChatWindow(QWidget):
         self._mic_worker = None
         if self._worker is None or not self._worker.isRunning():
             self._set_busy(False)
+            if self._hands_free:
+                self.start_listening()
+
+    def _on_chunk_ready(self, chunk: str):
+        # Track the true full text immediately (memory/TTS need the real
+        # content regardless of display pacing), but only feed the *visible*
+        # bubble complete words, released by _reveal_next_word on a timer --
+        # see the buffering note in __init__ for why.
+        self._reply_text_full += chunk
+        self._stream_leftover += chunk
+        whole_words = re.findall(r"\S+\s+", self._stream_leftover)
+        if whole_words:
+            consumed = "".join(whole_words)
+            self._stream_leftover = self._stream_leftover[len(consumed):]
+            self._word_queue.extend(whole_words)
+            if not self._reveal_timer.isActive():
+                self._reveal_timer.start()
+
+    def _reveal_next_word(self):
+        """Timer tick: pop one buffered word and grow the bubble with it.
+        Stops itself once the queue drains -- restarted by the next
+        _on_chunk_ready call (or _flush_stream_leftover at turn end)."""
+        if not self._word_queue:
+            self._reveal_timer.stop()
+            return
+        word = self._word_queue.popleft()
+        if self._reply_bubble is None:
+            self._reply_bubble = self._append_line("Lyra", word)
+        else:
+            self._reply_bubble.append_text(word)
+
+    def _flush_stream_leftover(self):
+        """Called once a turn's text is fully in (reply_ready/worker_finished)
+        -- queues whatever trailing partial word never got a following space
+        to complete the buffer, so the last word of a reply isn't dropped."""
+        if self._stream_leftover:
+            self._word_queue.append(self._stream_leftover)
+            self._stream_leftover = ""
+        if self._word_queue and not self._reveal_timer.isActive():
+            self._reveal_timer.start()
 
     def _on_reply_ready(self, text: str):
-        # Phase 4's tool-enabled replies arrive whole (see ToolWorker) --
-        # no streaming bubble to grow, just append the finished answer.
+        # The bubble is already fully built from chunk_ready by the time
+        # this fires -- this just gives the authoritative complete text for
+        # memory/TTS bookkeeping. Fall back to creating the bubble here only
+        # if no chunk ever arrived (e.g. the provider returned nothing to
+        # stream), so a reply is never silently dropped.
         self._reply_text_full = text
-        self._append_line("Lyra", text)
+        self._flush_stream_leftover()
+        if self._reply_bubble is None and text:
+            self._reply_bubble = self._append_line("Lyra", text)
 
     def _on_error(self, message: str):
         self._append_line("Error", message, is_error=True)
@@ -282,6 +383,8 @@ class ChatWindow(QWidget):
         else:
             self._set_busy(False)
             self.input_box.setFocus()
+            if self._hands_free:
+                self.start_listening()
         self._voice_turn = False
 
     def _speak_reply(self, text: str):
@@ -298,11 +401,29 @@ class ChatWindow(QWidget):
         self._tts_worker = None
         self._set_busy(False)
         self.input_box.setFocus()
+        if self._hands_free:
+            self.start_listening()
+
+    def _on_stop_clicked(self):
+        """Cancel the in-flight request. Cooperative (see ToolWorker.cancel):
+        the worker thread keeps running until ask_llm_with_tools notices and
+        returns, so _on_worker_finished still fires normally afterwards with
+        whatever partial text had already streamed in."""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self.stop_button.setEnabled(False)
+            self.status_label.setText("Stopping...")
 
     def _set_busy(self, busy: bool):
         self.input_box.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
-        self.mic_button.setEnabled(not busy)
+        # Mic button stays enabled even while busy -- in hands-free mode the
+        # app is busy almost continuously (listening/thinking/speaking on
+        # loop), so disabling it here would make the toggle unclickable and
+        # trap the user in hands-free mode with no way to turn it off.
+        self.mic_button.setEnabled(True)
+        self.stop_button.setVisible(busy)
+        self.stop_button.setEnabled(busy)  # fresh (re-)enable at the start of every turn
         # _speak_reply() overrides this to "Speaking..." right after busy is
         # set True for a voice turn's reply -- that happens after this call
         # returns, so it isn't clobbered here.

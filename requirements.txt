@@ -5,3 +5,7 @@ python-dotenv>=1.0.1
 SpeechRecognition>=3.10.4
 PyAudio>=0.2.14
 pyttsx3>=2.90
+
+# Phase 5 tools
+requests>=2.32.0    # weather_tool.py (Open-Meteo)
+ddgs>=9.0.0         # websearch_tool.py (DuckDuckGo search, no API key)

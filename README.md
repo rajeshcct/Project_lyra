@@ -1,9 +1,10 @@
-# Lyra — Setup & Phases 1–4
+# Lyra — Setup & Phases 1–6
 
 Status: **Phase 1 (bare LLM chat), Phase 2 (PySide6 chat UI), Phase 3
-(voice + personal memory), and Phase 4 (tool-calling framework +
-reasoning-trace panel) done.**
-Phase 5+ (more tools, personal-memory refinement) not started yet.
+(voice + personal memory), Phase 4 (tool-calling framework +
+reasoning-trace panel), Phase 5 (real tools + personal-memory
+refinement), and Phase 6 (multi-step tool chains) done.**
+Phase 7+ (further phases from the plan) not started yet.
 
 ---
 
@@ -105,7 +106,7 @@ Project_lyra/
 ├── .gitignore
 ├── requirements.txt
 ├── main.py                    # Phase 2/3/4: PySide6 window, entry point
-├── lyra_memory.db              # Phase 3: SQLite db (users, chat_history) — gitignored, created on first run
+├── lyra_memory.db              # Phase 3/5: SQLite db (users, chat_history, reminders) — gitignored, created on first run
 ├── assets/
 │   └── splash.png              # your own startup splash image (see below)
 └── lyra/                      # the actual application package
@@ -117,7 +118,8 @@ Project_lyra/
     ├── tts.py                       # Phase 3: speak() — OS text-to-speech via pyttsx3
     ├── mic_worker.py                 # Phase 3: QThread wrapper around stt.listen_once
     ├── tts_worker.py                  # Phase 3: QThread wrapper around tts.speak
-    ├── memory.py                       # Phase 3: SQLite users/chat_history + name-extraction + memory prefix
+    ├── memory.py                       # Phase 3/5: SQLite users/chat_history + name/preference extraction + rolling-summary context prefix
+    ├── reminders.py                     # Phase 5: SQLite reminders list (add/list/complete) backing reminder_tool.py
     ├── providers/                # one file per LLM backend, common interface
     │   ├── __init__.py            # auto-discovers & registers provider modules
     │   ├── base.py                 # LLMProvider abstract base class (ask/ask_stream/ask_with_tools)
@@ -128,7 +130,10 @@ Project_lyra/
     │   ├── __init__.py            # auto-discovers & registers tool modules
     │   ├── base.py                 # ToolSpec dataclass + TOOL_SAFETY_SYSTEM_PROMPT
     │   ├── registry.py              # name -> ToolSpec lookup used by ask_with_tools()
-    │   └── calculator_tool.py        # dummy tool that proves the loop end-to-end
+    │   ├── calculator_tool.py        # dummy tool that proves the loop end-to-end
+    │   ├── weather_tool.py            # Phase 5: current conditions via Open-Meteo (no API key)
+    │   ├── websearch_tool.py          # Phase 5: web search via the `ddgs` package (no API key)
+    │   └── reminder_tool.py           # Phase 5: add_reminder/list_reminders/complete_reminder over reminders.py
     └── ui/                        # visual concerns, one file each
         ├── theme.py                # color palette + stylesheet (QSS), one accent color
         ├── splash.py                # startup splash screen: fades in assets/splash.png
@@ -235,9 +240,96 @@ Tool calls/results show up live in the UI via the reasoning-trace panel
 Phase 2/3's did, since the model has to finish deciding whether to call a
 tool before any final answer text exists.
 
-## What's next (Phase 5)
+## Phase 5 notes
 
-Real tools beyond the dummy calculator (weather, web search, reminders —
-see `tools/__init__.py`'s docstring for how self-contained adding one is),
-and personal-memory refinement (preferences, the rolling-summary context
-pattern) on top of Phase 3's name-only memory.
+Two independent pieces, per the plan:
+
+**Real tools beyond the dummy calculator** — three new self-contained
+modules dropped into `tools/` (nothing else needed to change, per
+`tools/__init__.py`'s auto-discovery):
+
+- `weather_tool.py` — `get_weather(location, unit)` via Open-Meteo
+  (geocoding + forecast), free and keyless.
+- `websearch_tool.py` — `web_search(query)` via the `ddgs` package
+  (DuckDuckGo search), also free and keyless.
+- `reminder_tool.py` — `add_reminder` / `list_reminders` /
+  `complete_reminder`, backed by a new `reminders` table in
+  `lyra_memory.db` (`lyra/reminders.py`). This is a persisted list, not an
+  alarm clock: Lyra isn't always running, so there's no background
+  scheduler or OS notification when a reminder's time arrives — it's
+  surfaced back to the user only when they ask what's on their list.
+
+Both weather and web search import their third-party dependency
+(`requests`, `ddgs`) lazily inside the function rather than at module
+top, same reasoning as the provider modules lazily importing their own
+SDKs: `tools/__init__.py` imports every tool module at app startup, so a
+top-level import would mean a missing dependency crashes the whole app
+instead of just that one tool call.
+
+**Personal-memory refinement** (`lyra/memory.py`), on top of Phase 3's
+name-only memory:
+
+- **Preferences** — `maybe_extract_preference()` catches explicit
+  "I like/love/prefer/hate/dislike ..." and "my favorite X is Y"
+  statements (same conservative, low-false-positive spirit as the
+  existing name extractor — casual chat never becomes a stored
+  preference) and appends them to a capped, de-duplicated list in
+  `users.preferences`.
+- **Rolling-summary context pattern** — Phase 3 sent the model *zero*
+  conversation history (only the name line), so every turn was
+  effectively stateless beyond that. Phase 5 adds:
+  - `get_recent_turns()` — the last `RECENT_TURNS_KEPT` (8) messages,
+    sent to the model verbatim every turn.
+  - `maybe_condense_history()` — once more than
+    `RECENT_TURNS_KEPT + SUMMARY_BATCH_SIZE` messages have piled up, the
+    oldest `SUMMARY_BATCH_SIZE` (10) are folded into a running summary via
+    one extra LLM call (using whichever provider is already configured —
+    `memory.py` takes the summarizing call in as a plain function rather
+    than importing `providers/` itself, keeping it provider-agnostic),
+    then marked `summarized` so they're excluded from future context and
+    never re-summarized. A failed summarization call just gets retried
+    next turn — it never loses data.
+  - `build_memory_prefix()` now folds name + preferences + summary +
+    recent turns into one background-context preamble, same
+    "framed as context, not a live instruction" approach as Phase 3.
+
+Everything above is exercised from all three `llm_client.py` entry points
+(`ask_llm`, `ask_llm_stream`, `ask_llm_with_tools`) via two small shared
+helpers, `_extract_facts()` and `_log_user_turn_and_condense()`, so the
+plain/streaming/tool-calling paths can't drift out of sync with each
+other's memory handling.
+
+## Phase 6 notes
+
+Phase 4/5's `ask_with_tools` was a single round: the model could call
+tools exactly once per user turn, get the results back, and had to give
+its final answer right there. Phase 6 turns that into a loop (in both
+`groq_provider.py` and `gemini_provider.py`, each in their own idiom):
+model asks for tools -> Lyra runs them -> results go back to the model ->
+the model is asked again **with tools still on offer**, so it can chain
+further calls (e.g. search for something, then compute on what it found,
+then check something else) instead of being cut off after one round.
+
+- `lyra/config.py` adds `MAX_TOOL_ROUNDS` (default 5, overridable via
+  `.env`) — the cap on how many rounds of tool calls one request can
+  chain through. The loop keeps going as long as the model keeps
+  requesting tools; the moment a round comes back with no tool calls,
+  that round's text is the final answer.
+- If the model is still asking for tools after `MAX_TOOL_ROUNDS` rounds,
+  Lyra stops offering tools for one last call (Groq: `tool_choice="none"`;
+  Gemini: a tools-less `GenerateContentConfig`) so a runaway chain can't
+  hang the request forever — the model has to answer in text using
+  whatever it's already gathered. A `round_limit` event fires through
+  `on_tool_event` when this happens, so the reasoning-trace panel
+  (`lyra/ui/trace_panel.py`) shows the user that the cap was hit rather
+  than silently truncating.
+- Everything from Phase 4's security rules still applies unchanged every
+  round: the tool-safety system prompt, `requires_confirmation` blocking,
+  and errors-as-strings instead of raw exceptions.
+- No interface changes outside `providers/` — `llm_client.py`, `worker.py`,
+  and `main.py` call `ask_with_tools()` exactly as before; the multi-round
+  behavior is entirely internal to each provider's implementation.
+
+## What's next (Phase 7+)
+
+Whatever the plan's later phases call for beyond multi-step tool chains.

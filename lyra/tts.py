@@ -14,8 +14,14 @@ each worker run gets its own thread invocation of speak().
 
 import pyttsx3
 
+# pyttsx3's default rate (words per minute) comes from the OS SAPI5 voice
+# and is often ~200wpm, which reads as "too fast" for a spoken reply.
+# Lowering it here is the single knob that controls playback speed --
+# tune this one number if it still feels fast/slow.
+TTS_RATE_WPM = 150
 
-def speak(text: str) -> None:
+
+def speak(text: str, rate: int = TTS_RATE_WPM) -> None:
     """
     Speak `text` aloud via the OS's TTS voice, blocking until done.
 
@@ -28,6 +34,7 @@ def speak(text: str) -> None:
 
     try:
         engine = pyttsx3.init()
+        engine.setProperty("rate", rate)
         engine.say(text)
         engine.runAndWait()
         engine.stop()
