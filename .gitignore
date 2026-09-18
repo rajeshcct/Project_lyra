@@ -24,6 +24,9 @@ rag_store/
 # Phase 10 -- screenshots taken by take_screenshot(), local output only
 assets/screenshots/
 
+# Phase 14 -- notes saved by write_file(), local output only
+notes/
+
 # Phase 13 -- PyInstaller build output (regenerable from source + lyra.spec)
 build/
 dist/

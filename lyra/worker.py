@@ -16,7 +16,38 @@ import threading
 
 from PySide6.QtCore import QThread, Signal
 
-from .llm_client import ask_llm_stream, ask_llm_with_tools
+from .llm_client import ask_llm_stream, ask_llm_with_tools, start_new_session
+
+
+class NewSessionWorker(QThread):
+    """
+    Phase 15 -- background thread for starting a new session.
+
+    Same off-the-GUI-thread reasoning as every other worker in this file:
+    llm_client.start_new_session() can make one real LLM call (to fold
+    whatever's left of the outgoing session into the rolling summary
+    before switching session ids -- see memory.start_new_session's
+    docstring), so this can't run on the GUI thread any more than a
+    normal reply can without risking a freeze.
+    """
+
+    session_ready = Signal(str)
+    error_occurred = Signal(str)
+
+    def run(self):
+        try:
+            new_session_id = start_new_session()
+        except Exception as e:
+            # Broad on purpose -- unlike the other workers, everything
+            # inside start_new_session() that can plausibly fail (a bad
+            # summarize call) is already handled defensively and just
+            # skips folding that batch rather than raising. What's left is
+            # provider setup itself (e.g. a missing API key), which isn't
+            # necessarily a RuntimeError, so this catches anything rather
+            # than assuming a specific exception type.
+            self.error_occurred.emit(f"Couldn't start a new session: {e}")
+        else:
+            self.session_ready.emit(new_session_id)
 
 
 class LLMWorker(QThread):

@@ -32,6 +32,42 @@ from .tools import get_all_tools, TOOL_SAFETY_SYSTEM_PROMPT
 from . import memory
 
 
+# ---------------------------------------------------------------------------
+# Lyra's identity and personality — sent as part of the system context on
+# every single LLM call (ask, ask_stream, ask_with_tools) so she behaves
+# as "Lyra" rather than a generic ChatGPT-style assistant.
+# ---------------------------------------------------------------------------
+LYRA_PERSONA = (
+    "You are Lyra, a personal AI desktop assistant. You are warm, helpful, "
+    "concise, and slightly witty. You have your own identity — you are NOT "
+    "ChatGPT, Claude, Gemini, or any other public AI. You are Lyra.\n\n"
+    "Your capabilities (use them when relevant):\n"
+    "- Calculator: exact arithmetic via a safe evaluator\n"
+    "- Weather: real-time conditions for any city (Open-Meteo, free)\n"
+    "- Web search: current info via DuckDuckGo\n"
+    "- Reminders: add, list, complete, delete (SQLite-backed)\n"
+    "- Email: draft and send via Gmail (requires user confirmation)\n"
+    "- Open apps: Chrome, Notepad, VS Code, Spotify (allowlisted)\n"
+    "- Screenshots: capture the screen as PNG\n"
+    "- Music: play songs from the user's local music library\n"
+    "- YouTube: search and play videos in the browser\n"
+    "- Open URLs: open any website in the default browser\n"
+    "- Write files: create and save text/markdown files\n"
+    "- Documents: search uploaded PDFs and text files (RAG)\n"
+    "- Date/time: tell the current date, time, and day\n"
+    "- Memory: remember the user's name and preferences across sessions\n\n"
+    "Response guidelines:\n"
+    "- Keep replies concise and conversational — this is a chat window, not an essay.\n"
+    "- NEVER use markdown tables (|---|) — they don't render in this chat UI. "
+    "Use bullet points or numbered lists instead.\n"
+    "- NEVER say 'As an AI language model' or refer to yourself as ChatGPT, "
+    "GPT, Claude, Gemini, or any other AI. You are Lyra, always.\n"
+    "- When greeting, be warm but brief: 'Hey Rajesh!' not a paragraph.\n"
+    "- If you don't know something, say so honestly rather than guessing.\n"
+    "- Use emojis sparingly — one or two per reply at most, never a wall of them."
+)
+
+
 def _extract_facts(prompt: str) -> None:
     """Shared Phase 3/5 bookkeeping: extract a name and/or preference if
     this message explicitly states one. Deliberately run BEFORE
@@ -48,12 +84,47 @@ def _extract_facts(prompt: str) -> None:
         memory.add_preference(preference)
 
 
+def _build_system_context() -> str:
+    """Combine Lyra's persona with the user's personal memory context.
+    Sent as the system-level instruction on every LLM call so Lyra has
+    both her identity and everything she knows about this user."""
+    memory_ctx = memory.build_persistent_context()
+    parts = [LYRA_PERSONA]
+    if memory_ctx:
+        parts.append(memory_ctx)
+    return "\n\n".join(parts)
+
+
 def _log_user_turn_and_condense(prompt: str, provider) -> None:
     """Log the user's half of the turn *after* the prefix has already been
     built from prior history, then run the rolling-summary maintenance
     pass. Used by all three ask_llm* entry points so they stay in sync."""
     memory.log_message("user", prompt)
     memory.maybe_condense_history(provider.ask)
+
+
+def start_new_session() -> str:
+    """
+    Phase 15 -- "very very long chat" handoff: end the current session and
+    begin a fresh one. Gets the currently-configured provider the exact
+    same way every ask_llm* entry point above does, purely so its .ask can
+    be handed to memory.start_new_session() as the summarizing call --
+    see that function's docstring for why folding in whatever's left of
+    the outgoing session, right before the switch, is what keeps this
+    from silently dropping context.
+
+    Same RuntimeError contract as the other entry points isn't needed here
+    since get_provider()/summarize failures are already handled
+    defensively inside memory.start_new_session() (a failed fold just
+    means those rows stay unsummarized and get retried later) -- the only
+    thing that can still raise out of this is get_provider() itself
+    (e.g. a genuinely missing/invalid API key), which worker.py's
+    NewSessionWorker catches same as any other unexpected error.
+
+    Returns the new session id.
+    """
+    provider = get_provider(PROVIDER, api_key=API_KEY, model_name=MODEL_NAME)
+    return memory.start_new_session(provider.ask)
 
 
 def ask_llm(prompt: str) -> str:
@@ -76,7 +147,7 @@ def ask_llm(prompt: str) -> str:
     provider = get_provider(PROVIDER, api_key=API_KEY, model_name=MODEL_NAME)
     _extract_facts(prompt)
 
-    memory_context = memory.build_persistent_context()
+    memory_context = _build_system_context()
     session_history = memory.get_session_turns()
     _log_user_turn_and_condense(prompt, provider)
     reply = provider.ask(prompt, memory_context=memory_context, history=session_history)
@@ -102,7 +173,7 @@ def ask_llm_stream(prompt: str):
     provider = get_provider(PROVIDER, api_key=API_KEY, model_name=MODEL_NAME)
     _extract_facts(prompt)
 
-    memory_context = memory.build_persistent_context()
+    memory_context = _build_system_context()
     session_history = memory.get_session_turns()
     _log_user_turn_and_condense(prompt, provider)
 
@@ -155,7 +226,7 @@ def ask_llm_with_tools(
     provider = get_provider(PROVIDER, api_key=API_KEY, model_name=MODEL_NAME)
     _extract_facts(prompt)
 
-    memory_context = memory.build_persistent_context()
+    memory_context = _build_system_context()
     session_history = memory.get_session_turns()
     _log_user_turn_and_condense(prompt, provider)
     reply = provider.ask_with_tools(

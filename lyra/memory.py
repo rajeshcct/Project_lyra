@@ -244,30 +244,22 @@ def get_recent_turns(limit: int = RECENT_TURNS_KEPT) -> list[tuple[str, str]]:
     return list(reversed(rows))
 
 
-def maybe_condense_history(summarize: Callable[[str], str]) -> None:
+def _fold_oldest_batch(summarize: Callable[[str], str]) -> bool:
     """
-    Rolling-summary maintenance: if there are more than
-    RECENT_TURNS_KEPT + SUMMARY_BATCH_SIZE rows sitting unsummarized,
-    fold the oldest SUMMARY_BATCH_SIZE of them (past the recent window
-    that stays verbatim) into the running summary via one call to
-    `summarize(prompt) -> text`, then mark those rows as summarized so
-    they're excluded from future get_recent_turns() calls and never
-    re-summarized.
+    Fold the oldest still-unsummarized SUMMARY_BATCH_SIZE rows into the
+    rolling summary via one call to `summarize(prompt) -> text`, then mark
+    those rows as summarized so they're excluded from future
+    get_recent_turns() calls and never re-summarized. Shared by
+    maybe_condense_history() (gated on the RECENT_TURNS_KEPT threshold)
+    and start_new_session() (which calls this in a loop, unconditionally,
+    to fold in everything left before the session id changes -- see that
+    function's docstring for why).
 
-    `summarize` is a plain callable rather than an import of providers/
-    so this module stays provider-agnostic — llm_client.py passes in
-    whichever provider's .ask is currently configured. If the call fails
-    for any reason, the old rows are simply left alone and tried again
-    next turn — losing one summarization pass costs nothing but a
-    slightly longer history, never data.
+    Returns True if a batch was found and successfully folded in, False if
+    there was nothing left to fold or the summarize call failed/returned
+    nothing usable -- either way the caller should stop looping.
     """
     with _connect() as conn:
-        total = conn.execute(
-            "SELECT COUNT(*) FROM chat_history WHERE summarized = 0"
-        ).fetchone()[0]
-        if total <= RECENT_TURNS_KEPT + SUMMARY_BATCH_SIZE:
-            return
-
         to_fold = conn.execute(
             """
             SELECT id, role, content FROM chat_history
@@ -279,7 +271,7 @@ def maybe_condense_history(summarize: Callable[[str], str]) -> None:
         ).fetchall()
 
     if not to_fold:
-        return
+        return False
 
     transcript = "\n".join(f"{role}: {content}" for _, role, content in to_fold)
     previous_summary = get_summary() or "(none yet)"
@@ -299,12 +291,12 @@ def maybe_condense_history(summarize: Callable[[str], str]) -> None:
         new_summary = summarize(prompt)
     except Exception:
         # Best-effort: a failed summarization call just means this batch
-        # gets retried next turn instead of being lost.
-        return
+        # gets retried next time instead of being lost.
+        return False
 
     new_summary = (new_summary or "").strip()
     if not new_summary:
-        return
+        return False
 
     ids = [row[0] for row in to_fold]
     with _connect() as conn:
@@ -313,6 +305,70 @@ def maybe_condense_history(summarize: Callable[[str], str]) -> None:
             [(i,) for i in ids],
         )
     set_summary(new_summary)
+    return True
+
+
+def maybe_condense_history(summarize: Callable[[str], str]) -> None:
+    """
+    Rolling-summary maintenance: if there are more than
+    RECENT_TURNS_KEPT + SUMMARY_BATCH_SIZE rows sitting unsummarized, fold
+    the oldest SUMMARY_BATCH_SIZE of them (past the recent window that
+    stays verbatim) into the running summary.
+
+    `summarize` is a plain callable rather than an import of providers/
+    so this module stays provider-agnostic — llm_client.py passes in
+    whichever provider's .ask is currently configured.
+    """
+    with _connect() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM chat_history WHERE summarized = 0"
+        ).fetchone()[0]
+    if total <= RECENT_TURNS_KEPT + SUMMARY_BATCH_SIZE:
+        return
+
+    _fold_oldest_batch(summarize)
+
+
+def start_new_session(summarize: Optional[Callable[[str], str]] = None) -> str:
+    """
+    Close out the current session and begin a fresh one -- the "handle a
+    conversation that's gone on very very long" feature: a session that
+    just keeps growing eventually pushes against the provider's own
+    context-window limit. The fix isn't to keep sending more and more raw
+    history, it's to let the *verbatim per-session* window reset while
+    what actually matters -- the user's name, their preferences, and a
+    running summary -- carries forward untouched, because those already
+    live in the session-independent `users` row, not in chat_history
+    filtered by session_id.
+
+    The one thing that needs care: anything still sitting unsummarized
+    when the switch happens would otherwise be stranded. get_session_turns()
+    is filtered by session_id, so once SESSION_ID changes those rows stop
+    being sent to the model at all, verbatim or otherwise -- and ordinary
+    maybe_condense_history() calls only fire once enough *new* rows pile
+    up in the *new* session, which could take a long time, or might never
+    happen for a short-lived session. So if a `summarize` callable is
+    given (the caller's provider.ask, same contract as
+    maybe_condense_history()), every remaining unsummarized batch is
+    folded into the rolling summary right now, before the switch, so
+    nothing from the outgoing session is silently dropped -- unlike
+    maybe_condense_history(), this isn't gated on the RECENT_TURNS_KEPT
+    threshold, since none of those rows will be sent verbatim again once
+    the session id changes anyway.
+
+    If no `summarize` callable is given (e.g. no provider available), the
+    switch still happens -- those rows just sit unsummarized until some
+    later session's ordinary maybe_condense_history() call eventually
+    reaches them.
+
+    Returns the new session id.
+    """
+    global SESSION_ID
+    if summarize is not None:
+        while _fold_oldest_batch(summarize):
+            pass  # keep folding batches until nothing unsummarized is left
+    SESSION_ID = uuid.uuid4().hex
+    return SESSION_ID
 
 
 def get_session_turns(limit: int = RECENT_TURNS_KEPT) -> list[dict]:

@@ -83,6 +83,7 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QParallelAnimationGroup,
     QEasingCurve,
+    Signal,
 )
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
@@ -105,7 +106,7 @@ from PySide6.QtWidgets import (
 from pathlib import Path
 
 from lyra.config import PROVIDER
-from lyra.worker import ToolWorker
+from lyra.worker import ToolWorker, NewSessionWorker
 from lyra.mic_worker import MicWorker
 from lyra.tts_worker import TTSWorker
 from lyra.scheduler import ReminderScheduler
@@ -122,6 +123,14 @@ ASSETS_DIR = BUNDLE_ROOT / "assets"
 
 
 class ChatWindow(QWidget):
+    # Phase 14 -- emitted by tools/window_tool.py's show_window() from the
+    # ToolWorker background thread. QWidget methods (raise_/activateWindow)
+    # aren't safe to call from a non-GUI thread, but emitting a Qt signal
+    # is -- Qt auto-queues delivery of the connected slot onto this
+    # window's own GUI thread, same cross-thread pattern already used for
+    # tool_event/chunk_ready/confirmation_requested below.
+    bring_to_foreground = Signal()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Lyra — Phase 11 Chat ({PROVIDER})")
@@ -137,6 +146,7 @@ class ChatWindow(QWidget):
         self._mic_worker = None
         self._tts_worker = None
         self._rag_worker = None  # Phase 9 -- keeps a reference so the ingest QThread isn't GC'd mid-run
+        self._new_session_worker = None  # Phase 15 -- same GC-reference reasoning as the other *_worker attrs
         self._voice_turn = False
         self._hands_free = False  # True after mic button is toggled on -- keeps re-listening
         self._reply_text_full = ""  # last reply's full text, for TTS once it finishes
@@ -154,9 +164,39 @@ class ChatWindow(QWidget):
         self._reveal_timer.setInterval(100)  # ms between words -- raise/lower to slow/speed up
         self._reveal_timer.timeout.connect(self._reveal_next_word)
 
+        self.bring_to_foreground.connect(self._on_bring_to_foreground)
+
         self._build_ui()
         self._init_tray_icon()
         self._start_reminder_scheduler()
+        self._register_with_window_tool()
+
+    # -- Phase 14 -- voice/text command to raise this window -------------
+
+    def _register_with_window_tool(self):
+        """Hands this exact window instance to tools/window_tool.py, once,
+        right after it's built -- tools/ modules are plain functions with
+        no reference to any QWidget (they're imported at app startup,
+        before this window exists), so this one-way hook is how
+        show_window() later reaches it."""
+        from lyra.tools import window_tool
+        window_tool.register_window(self)
+
+    def _on_bring_to_foreground(self):
+        """Un-minimize, raise above other windows, and ask Windows for
+        input focus. SetForegroundWindow is also called directly via
+        ctypes as a fallback -- Qt's activateWindow() alone can be
+        silently ignored by Windows' foreground-lock rules if this process
+        hasn't received recent input (e.g. the user's been talking to
+        another app while Lyra sat in hands-free voice mode)."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        try:
+            import ctypes
+            ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
+        except Exception:
+            pass  # best-effort -- the Qt calls above already cover most cases
 
     # -- Phase 7 -- reminder scheduler + system notifications ------------
 
@@ -328,6 +368,7 @@ class ChatWindow(QWidget):
         # Phase 3 -- mic button. Sits next to Send; text input above it stays
         # the permanent fallback per the plan.
         self.mic_button = QPushButton("🎤")
+        self.mic_button.setObjectName("iconButton")
         self.mic_button.setToolTip("Toggle hands-free listening (no need to click each turn)")
         self.mic_button.setFixedWidth(44)
         self.mic_button.setCheckable(True)
@@ -345,6 +386,7 @@ class ChatWindow(QWidget):
         # on disk gets indexed, that's a user action through a real file
         # dialog, per the plan's "Person A builds upload UI" split.
         self.upload_button = QPushButton("\U0001F4CE")
+        self.upload_button.setObjectName("iconButton")
         self.upload_button.setToolTip("Upload a PDF or text file for Lyra to search")
         self.upload_button.setFixedWidth(44)
         self.upload_button.clicked.connect(self._on_upload_clicked)
@@ -360,6 +402,7 @@ class ChatWindow(QWidget):
         # stop its refresh timer, so this button doesn't need to manage
         # that itself.
         self.dashboard_button = QPushButton("\U0001F4CA")
+        self.dashboard_button.setObjectName("iconButton")
         self.dashboard_button.setToolTip("Show/hide the dashboard (reminders, recent commands, documents)")
         self.dashboard_button.setFixedWidth(44)
         self.dashboard_button.setCheckable(True)
@@ -370,6 +413,30 @@ class ChatWindow(QWidget):
         dashboard_glow.setOffset(0, 0)
         self.dashboard_button.setGraphicsEffect(dashboard_glow)
         input_row.addWidget(self.dashboard_button)
+
+        # Phase 15 -- new session button. For when a conversation has gone
+        # on very, very long and is at risk of outgrowing the provider's
+        # context window: folds whatever's left of the current session
+        # into the persistent rolling summary (see memory.start_new_session),
+        # then clears the visible transcript for a clean slate. Name,
+        # preferences, and the summary itself all survive the switch --
+        # only the raw per-session turn history and the on-screen chat
+        # reset.
+        self.new_session_button = QPushButton("\U0001F195")
+        self.new_session_button.setObjectName("iconButton")
+        self.new_session_button.setToolTip(
+            "Start a new session -- folds this conversation into memory, "
+            "then clears the chat. Use this if a conversation has been "
+            "going on for a very long time."
+        )
+        self.new_session_button.setFixedWidth(44)
+        self.new_session_button.clicked.connect(self._on_new_session_clicked)
+        new_session_glow = QGraphicsDropShadowEffect(self.new_session_button)
+        new_session_glow.setColor(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 130))
+        new_session_glow.setBlurRadius(16)
+        new_session_glow.setOffset(0, 0)
+        self.new_session_button.setGraphicsEffect(new_session_glow)
+        input_row.addWidget(self.new_session_button)
 
         # Stop button: only meaningful while a request is in flight, so it
         # starts hidden and _set_busy() toggles its visibility. Cancels the
@@ -389,6 +456,21 @@ class ChatWindow(QWidget):
     def send_message(self, voice_triggered: bool = False):
         prompt = self.input_box.text().strip()
         if not prompt:
+            return
+
+        # Phase 15 -- the mic button stays enabled even while _set_busy(True)
+        # (see its comment below), which means hands-free voice could still
+        # turn a recognized utterance into a send_message() call while a
+        # new-session switch is running in the background. Letting that
+        # through would log this turn against whichever session_id happens
+        # to win the race, and could interleave with _clear_transcript()
+        # wiping the transcript mid-append -- so this is refused the same
+        # way an empty prompt is, rather than proceeding.
+        if self._new_session_worker is not None:
+            self._append_line(
+                "System",
+                "Starting a new session -- try that again in a moment.",
+            )
             return
 
         self._voice_turn = voice_triggered  # only speak the reply if this turn started by voice
@@ -427,7 +509,15 @@ class ChatWindow(QWidget):
         auto-restart; any listen already in flight still finishes normally."""
         self._hands_free = checked
         self.mic_button.setText("🔴" if checked else "🎤")
-        if checked and self._mic_worker is None and self._worker is None and self._tts_worker is None:
+        # Bug fix -- self._worker is set once on the very first message and
+        # never reset back to None afterward (it just stops running once
+        # the reply is in), so the old `self._worker is None` check here
+        # only ever passed before any message had been sent at all --
+        # hands-free could be turned on once, but a later click could never
+        # re-arm it. isRunning() is the real "is a request in flight" test,
+        # same one _on_mic_finished already uses below.
+        worker_busy = self._worker is not None and self._worker.isRunning()
+        if checked and self._mic_worker is None and not worker_busy and self._tts_worker is None:
             self.start_listening()
 
     def start_listening(self):
@@ -436,6 +526,15 @@ class ChatWindow(QWidget):
         (see _on_mic_finished / _on_tts_finished / _on_worker_finished)."""
         if self._mic_worker is not None:
             return  # already listening -- ignore a repeat click
+
+        # Phase 15 -- don't open the mic mid-session-switch; a recognized
+        # utterance would just be refused by send_message()'s own guard
+        # anyway, but skipping it here avoids a pointless capture (and the
+        # brief "Listening..." status flashing over "Starting new
+        # session..."). _on_new_session_finished() re-arms hands-free once
+        # the switch is done, so nothing is lost, just delayed.
+        if self._new_session_worker is not None:
+            return
 
         self._set_busy(True)
         self.status_label.setText("Listening...")  # override _set_busy's default "Thinking..."
@@ -511,6 +610,106 @@ class ChatWindow(QWidget):
     def _toggle_dashboard(self, checked: bool):
         self.dashboard_panel.setVisible(checked)
 
+    # -- Phase 15 -- new session (long-chat handoff) -----------------------
+
+    def _on_new_session_clicked(self):
+        if self._new_session_worker is not None:
+            return  # already in progress -- ignore a repeat click
+
+        # Refuse to switch sessions out from under an in-flight request:
+        # memory.log_message() reads the module-level SESSION_ID at the
+        # moment it's called, so a request that's still writing its
+        # user/assistant turns while SESSION_ID changes underneath it
+        # would end up with one turn logged to the old session and the
+        # other to the new one -- exactly the kind of split-session mess
+        # this feature exists to avoid, not cause. Busy from a text/voice
+        # reply, a mic capture, TTS playback, or a document upload all
+        # count -- any of them can still be mid-write.
+        busy = (
+            (self._worker is not None and self._worker.isRunning())
+            or self._mic_worker is not None
+            or self._tts_worker is not None
+            or self._rag_worker is not None
+        )
+        if busy:
+            self._append_line(
+                "System",
+                "Let the current request finish before starting a new session.",
+            )
+            return
+
+        self.new_session_button.setEnabled(False)
+        self._set_busy(True)
+        self.stop_button.hide()  # nothing to cancel here -- _set_busy(True) shows it by default
+        self.status_label.setText("Starting new session...")
+
+        self._new_session_worker = NewSessionWorker()
+        self._new_session_worker.session_ready.connect(self._on_new_session_ready)
+        self._new_session_worker.error_occurred.connect(self._on_new_session_error)
+        self._new_session_worker.finished.connect(self._on_new_session_finished)
+        self._new_session_worker.start()
+
+    def _on_new_session_ready(self, new_session_id: str):
+        # Drop any leftover per-turn streaming state before clearing --
+        # none of it applies to the fresh session, and leaving the reveal
+        # timer/queue armed could otherwise replay stale words into
+        # whatever gets appended next (the same class of bug _on_reply_ready
+        # now guards against for a single turn).
+        self._reveal_timer.stop()
+        self._word_queue.clear()
+        self._stream_leftover = ""
+        self._reply_bubble = None
+        self._reply_text_full = ""
+        self.trace_panel.clear()
+
+        self._clear_transcript()
+        self._append_line(
+            "System",
+            "New session started. Earlier context has been folded into "
+            "memory, so Lyra still remembers your name, preferences, and "
+            "the gist of the conversation so far -- the chat below is just "
+            "a clean slate.",
+        )
+
+    def _on_new_session_error(self, message: str):
+        self._append_line("Error", message, is_error=True)
+
+    def _on_new_session_finished(self):
+        self._new_session_worker = None
+        self.new_session_button.setEnabled(True)
+        self._set_busy(False)
+        self.input_box.setFocus()
+        # Resume hands-free listening if start_listening() skipped its turn
+        # while this was running (see its own new-session guard above).
+        if self._hands_free and self._mic_worker is None:
+            self.start_listening()
+
+    def _clear_transcript(self):
+        """Remove every message bubble from the transcript, keeping the
+        trailing stretch item that pins new bubbles to the bottom (see
+        _build_ui -- addStretch(1) is added once and every row is inserted
+        before it, so it always ends up last)."""
+        while self.transcript_layout.count() > 1:
+            item = self.transcript_layout.takeAt(0)
+            child_layout = item.layout()
+            if child_layout is not None:
+                self._clear_layout(child_layout)
+
+    @staticmethod
+    def _clear_layout(layout):
+        """Recursively empty a layout, deleting any widgets it holds.
+        Qt's layout removal APIs don't delete child widgets on their own --
+        without this, cleared bubbles would keep existing (invisible, but
+        alive) instead of actually being freed."""
+        while layout.count():
+            item = layout.takeAt(0)
+            child_widget = item.widget()
+            child_layout = item.layout()
+            if child_widget is not None:
+                child_widget.deleteLater()
+            elif child_layout is not None:
+                ChatWindow._clear_layout(child_layout)
+
     def _on_chunk_ready(self, chunk: str):
         # Track the true full text immediately (memory/TTS need the real
         # content regardless of display pacing), but only feed the *visible*
@@ -550,15 +749,39 @@ class ChatWindow(QWidget):
             self._reveal_timer.start()
 
     def _on_reply_ready(self, text: str):
-        # The bubble is already fully built from chunk_ready by the time
-        # this fires -- this just gives the authoritative complete text for
-        # memory/TTS bookkeeping. Fall back to creating the bubble here only
-        # if no chunk ever arrived (e.g. the provider returned nothing to
-        # stream), so a reply is never silently dropped.
+        # Normally the bubble is already fully built from chunk_ready by
+        # the time this fires -- this just gives the authoritative
+        # complete text for memory/TTS bookkeeping.
+        #
+        # BUG THIS FIXES: on a fast/short reply, every chunk_ready chunk
+        # can arrive and reply_ready can fire before the word-reveal timer
+        # (100ms interval) ever ticks once, so self._reply_bubble is still
+        # None here even though self._word_queue already holds every word
+        # of the reply. The old code's fallback then created a bubble with
+        # the complete text right here, but left the timer running and the
+        # queue untouched, so moments later _reveal_next_word kept firing,
+        # saw self._reply_bubble was no longer None, and appended each
+        # already-shown word onto that same bubble again. The reply ended
+        # up doubled (or briefly tripled) inside one bubble -- this is what
+        # showed up as the same response appearing two or three times.
+        # Groq streams fast enough that short replies hit this race almost
+        # every time.
+        #
+        # Fix: when about to take the fallback path (no reveal tick ever
+        # ran), stop the timer and drop the queued words/leftover first --
+        # the full text is being shown directly, so there is nothing left
+        # for the timer to redraw. When a bubble already exists, behave
+        # exactly as before and just flush the trailing partial word so
+        # the timer finishes the reveal normally.
         self._reply_text_full = text
-        self._flush_stream_leftover()
-        if self._reply_bubble is None and text:
-            self._reply_bubble = self._append_line("Lyra", text)
+        if self._reply_bubble is None:
+            self._reveal_timer.stop()
+            self._word_queue.clear()
+            self._stream_leftover = ""
+            if text:
+                self._reply_bubble = self._append_line("Lyra", text)
+        else:
+            self._flush_stream_leftover()
 
     def _on_error(self, message: str):
         self._append_line("Error", message, is_error=True)
@@ -581,6 +804,19 @@ class ChatWindow(QWidget):
                 f"Subject: {subject}\n\n"
                 f"{body}\n\n"
                 "Send it?"
+            )
+        if tool_name == "write_file":
+            # Phase 14 -- same reasoning as send_email above: a multi-line
+            # note squashed into one comma-joined key=value line would be
+            # unreadable right when readability matters most (this is the
+            # human's one chance to catch bad content before it's written).
+            filename = args.get("filename", "")
+            content = args.get("content", "")
+            return (
+                "Lyra wants to save this file:\n\n"
+                f"Filename: {filename}\n\n"
+                f"{content}\n\n"
+                "Save it?"
             )
         args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items()) or "(no arguments)"
         return f"Lyra wants to run '{tool_name}' with:\n{args_preview}\n\nAllow this?"
@@ -650,6 +886,12 @@ class ChatWindow(QWidget):
         # loop), so disabling it here would make the toggle unclickable and
         # trap the user in hands-free mode with no way to turn it off.
         self.mic_button.setEnabled(True)
+        # Disable non-essential buttons while busy so accidental clicks
+        # can't open the dashboard, start a new session, or trigger an
+        # upload mid-reply.
+        self.upload_button.setEnabled(not busy)
+        self.dashboard_button.setEnabled(not busy)
+        self.new_session_button.setEnabled(not busy)
         self.stop_button.setVisible(busy)
         self.stop_button.setEnabled(busy)  # fresh (re-)enable at the start of every turn
         # _speak_reply() overrides this to "Speaking..." right after busy is

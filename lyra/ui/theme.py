@@ -88,6 +88,18 @@ QPushButton:disabled {{
     background: transparent;
 }}
 
+/* Icon-only buttons (mic/upload/dashboard) hold emoji glyphs (🎤 📎 📊),
+   which the app-wide Consolas/Cascadia Mono monospace font above has no
+   glyphs for -- Qt then renders nothing rather than falling back, so
+   these buttons showed up blank. Segoe UI Emoji (ships with Windows
+   10/11) is the one font on this font-family list that actually has
+   them. */
+QPushButton#iconButton {{
+    font-family: 'Segoe UI Emoji', 'Segoe UI Symbol', sans-serif;
+    font-size: 16px;
+    padding: 8px 10px;
+}}
+
 QLabel#status {{
     color: {TEXT_DIM.name()};
     font-style: italic;

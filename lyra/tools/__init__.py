@@ -45,3 +45,8 @@ from . import reminder_tool  # noqa: F401
 from . import email_tool  # noqa: F401
 from . import rag_tool  # noqa: F401
 from . import system_control_tool  # noqa: F401
+from . import browser_tool  # noqa: F401  -- Phase 14: open_url, play_youtube
+from . import music_tool  # noqa: F401  -- Phase 14: play_music, list_music
+from . import notes_tool  # noqa: F401  -- Phase 14: write_file
+from . import datetime_tool  # noqa: F401  -- Phase 14: get_datetime
+from . import window_tool  # noqa: F401  -- Phase 14: show_window
