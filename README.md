@@ -1,10 +1,24 @@
-# Lyra — Setup & Phases 1–6
+# Lyra — Setup & Phases 1–8
 
 Status: **Phase 1 (bare LLM chat), Phase 2 (PySide6 chat UI), Phase 3
 (voice + personal memory), Phase 4 (tool-calling framework +
 reasoning-trace panel), Phase 5 (real tools + personal-memory
-refinement), and Phase 6 (multi-step tool chains) done.**
-Phase 7+ (further phases from the plan) not started yet.
+refinement), Phase 6 (multi-step tool chains), Phase 7
+(human-in-the-loop tool confirmation), and Phase 8 (Gmail email tool)
+done.** Also includes a message-array + session-scoped-memory rework
+(proper alternating user/assistant history instead of one flat string —
+see "Message array & session memory" below).
+
+**Note on Phase 7/8 ordering:** the plan's Phase 7 also calls for an
+APScheduler background poller + OS notification for due reminders — that
+piece isn't built yet (reminders are still a list you ask Lyra to read
+back, not an alarm clock; see `reminders.py`'s scope note). Only Phase
+7's *other* half — human-in-the-loop confirmation for sensitive tools —
+is done, which is what Phase 8's email-send gate reuses. The plan's
+"wire email into the reminder scheduler" step is therefore still
+outstanding until that scheduler exists — flag it if you want that built
+next, either as the rest of Phase 7 or folded into Phase 8.
+Phase 9+ (further phases from the plan) not started yet.
 
 ---
 
@@ -16,6 +30,36 @@ Phase 7+ (further phases from the plan) not started yet.
 
 (You'll also want a free Groq key from https://console.groq.com/keys if
 `LLM_PROVIDER=groq`, which is the default.)
+
+## 1b. One-time Gmail setup (needed for the `send_email` tool)
+
+This is a one-time step per developer machine — skip it if you don't need
+email yet, the rest of the app runs fine without it (the tool just errors
+out with a setup reminder if you try to use it before this is done).
+
+1. Go to https://console.cloud.google.com/ and create a project (or pick
+   an existing one) — top-left project dropdown → "New Project".
+2. In that project, go to **APIs & Services → Library**, search for
+   "Gmail API", and click **Enable**.
+3. Go to **APIs & Services → OAuth consent screen**. Choose **External**
+   (unless you have a Google Workspace org), fill in the required fields
+   (app name, your email for support/developer contact), and save. On the
+   "Test users" step, add the Google account you'll actually send email
+   from — while the app is in "Testing" mode, only accounts listed here
+   can complete the login.
+4. Go to **APIs & Services → Credentials → Create Credentials → OAuth
+   client ID**. Application type: **Desktop app**. Give it any name and
+   click Create.
+5. Click **Download JSON** on the credential you just created. Rename the
+   downloaded file to exactly `credentials.json` and put it in the
+   project root (`Project_lyra\credentials.json`, next to `main.py`).
+6. That's it — no `.env` entry needed. The first time Lyra actually tries
+   to send an email, your system browser will open asking you to log in
+   and approve the `gmail.send` permission; after that, a `token.json`
+   file appears in the project root and you won't be asked again (it
+   auto-refreshes). Both `credentials.json` and `token.json` are already
+   in `.gitignore` — never commit either one, `token.json` especially
+   (anyone holding it can send email as that Google account).
 
 ## 2. One-time setup (run these in a terminal, inside this folder)
 
@@ -120,6 +164,7 @@ Project_lyra/
     ├── tts_worker.py                  # Phase 3: QThread wrapper around tts.speak
     ├── memory.py                       # Phase 3/5: SQLite users/chat_history + name/preference extraction + rolling-summary context prefix
     ├── reminders.py                     # Phase 5: SQLite reminders list (add/list/complete) backing reminder_tool.py
+    ├── gmail_client.py                    # Phase 8: Gmail OAuth (Desktop flow) + send_email, backing tools/email_tool.py
     ├── providers/                # one file per LLM backend, common interface
     │   ├── __init__.py            # auto-discovers & registers provider modules
     │   ├── base.py                 # LLMProvider abstract base class (ask/ask_stream/ask_with_tools)
@@ -133,7 +178,8 @@ Project_lyra/
     │   ├── calculator_tool.py        # dummy tool that proves the loop end-to-end
     │   ├── weather_tool.py            # Phase 5: current conditions via Open-Meteo (no API key)
     │   ├── websearch_tool.py          # Phase 5: web search via the `ddgs` package (no API key)
-    │   └── reminder_tool.py           # Phase 5: add_reminder/list_reminders/complete_reminder over reminders.py
+    │   ├── reminder_tool.py           # Phase 5/7: add/list/complete over reminders.py; delete/clear require confirmation
+    │   └── email_tool.py               # Phase 8: send_email over gmail_client.py; requires confirmation
     └── ui/                        # visual concerns, one file each
         ├── theme.py                # color palette + stylesheet (QSS), one accent color
         ├── splash.py                # startup splash screen: fades in assets/splash.png
@@ -230,8 +276,10 @@ are built into the framework itself, not left for a later phase to retrofit:
 3. **Human-triggered confirmation for sensitive actions** —
    `ToolSpec.requires_confirmation` exists now (default `False`); both
    providers refuse to auto-run a tool with it set to `True` rather than
-   executing it silently. No Phase 4 tool sets it yet — an actual
-   confirmation dialog is Phase 5+ work, once there's a tool that needs one.
+   executing it silently. No Phase 4 tool sets it yet — the actual
+   confirmation dialog (a tool that needs one, plus the human-in-the-loop
+   wiring through worker.py/main.py) is Phase 7 (see "Phase 7 notes"
+   below).
 
 Tool calls/results show up live in the UI via the reasoning-trace panel
 (`lyra/ui/trace_panel.py`), driven by `ToolWorker`'s `tool_event` signal
@@ -330,6 +378,117 @@ then check something else) instead of being cut off after one round.
   and `main.py` call `ask_with_tools()` exactly as before; the multi-round
   behavior is entirely internal to each provider's implementation.
 
-## What's next (Phase 7+)
+## Phase 7 notes
 
-Whatever the plan's later phases call for beyond multi-step tool chains.
+Phase 7 is Security rule #3 from the plan actually wired up end-to-end:
+sensitive tools (`ToolSpec.requires_confirmation = True`) now pause and
+ask a human before running, instead of just refusing outright the way
+Phase 4/6 did.
+
+- `tools/reminder_tool.py` gets Lyra's first two confirmation-gated
+  tools: `delete_reminder` and `clear_reminders` — both permanently
+  remove data with no undo, unlike `complete_reminder` (recoverable —
+  the row just gets flagged done) which stays unconfirmed.
+- `providers/base.py`'s `ask_with_tools()` gains an
+  `on_confirmation_required(tool_name, args) -> bool` parameter. Both
+  providers call it (blocking on its return value) right before running
+  a `requires_confirmation` tool's `func`, emitting a
+  `tool_confirmation_requested` event first so a UI can show *why* it's
+  blocking. `True` runs the tool normally; `False` (or the callback
+  raising) skips `func` and feeds the model a short "user declined"
+  string instead, so it can still answer sensibly. No callback given
+  (e.g. a headless caller) falls back to Phase 4/6's plain refusal.
+- `worker.py`'s `ToolWorker` bridges this over to the GUI thread: a
+  `threading.Event` + `provide_confirmation()` pair lets the background
+  thread block synchronously while `confirmation_requested` gets
+  auto-queued to Qt's main thread. `main.py`'s
+  `_on_confirmation_requested` is the actual dialog (`QMessageBox`,
+  defaulting focus to **No** so a sensitive action can never fire from a
+  stray Enter press) and calls `provide_confirmation()` with the
+  answer.
+- `Stop` also unblocks a pending confirmation (treated as a decline) so
+  cancelling can't be swallowed by a dialog nobody's answering.
+- The reasoning-trace panel shows the full lifecycle:
+  `tool_confirmation_requested` -> `tool_confirmed`/`tool_denied`, on top
+  of the existing `tool_call`/`tool_result`/`tool_error`/`tool_blocked`.
+
+## Message array & session memory
+
+Alongside Phase 7, `ask_with_tools`/`ask`/`ask_stream` across both
+providers stopped concatenating memory + history into one flat string
+tacked onto the user prompt, and now send it as the message array it
+always should have been:
+
+- **System message** — `TOOL_SAFETY_SYSTEM_PROMPT` (tool-enabled calls
+  only) plus `memory.build_persistent_context()` (name, preferences,
+  rolling summary — persistent facts, no verbatim turns) combined into
+  one real system-role message (Groq) / `system_instruction` (Gemini).
+- **Real history** — `memory.get_session_turns()` returns the last
+  `RECENT_TURNS_KEPT` (now 4) turns from the **current session only**,
+  sent as actual alternating `user`/`assistant` messages instead of a
+  fake "User: ... / Lyra: ..." text block, so the model reads them as
+  real prior turns rather than as content of the live message.
+- **Live message** — the current prompt, appended last, exactly as
+  before.
+
+`get_recent_turns()` and `maybe_condense_history()` are unchanged and
+still maintain the cross-session rolling summary the same way Phase 5
+built them — that summary is what carries continuity across an app
+restart now, rather than resending old sessions' raw turns verbatim.
+`build_memory_prefix()` (the old flat-string builder) is kept in
+`memory.py` unused by any current call site, in case a future
+headless/CLI caller wants the simpler single-string shape.
+
+This fixes role confusion (the model no longer reads fake history as
+part of the user's own message) and cross-session noise (yesterday's
+verbatim turns no longer get resent every prompt — only today's session
+does, plus the summary for everything older).
+
+## Phase 8 notes
+
+Email (Gmail API), exactly one new tool over one new headless module:
+
+- `lyra/gmail_client.py` — all Gmail-specific logic. Uses the **Desktop
+  app OAuth credential type** (per the plan: opens the system browser
+  briefly for a one-time consent screen, no web redirect URI needed) and
+  requests only the `gmail.send` scope — this app can send email, never
+  read, list, or delete anything in the user's mailbox. `credentials.json`
+  (the OAuth client, downloaded once from Google Cloud Console — see
+  "One-time Gmail setup" above) and `token.json` (this user's
+  access/refresh token, created automatically after the first login) both
+  live in the project root and are gitignored. Every `google-auth`/
+  `googleapiclient` import is lazy inside functions, same convention as
+  `weather_tool.py`/`websearch_tool.py`, so a missing dependency only
+  breaks email-related calls instead of crashing the whole app at
+  startup.
+- `lyra/tools/email_tool.py` — one tool, `send_email(to, subject, body)`,
+  registered with `requires_confirmation=True`. The model composes a full
+  draft as the tool's arguments; Phase 7's existing confirmation framework
+  (already built — nothing new added there) pauses and shows it to the
+  human before `gmail_client.send_email()` ever actually runs. This is a
+  direct instance of the plan's Security Considerations rule: *"the
+  `send_email()` function must only execute when a 'confirmed' flag is set
+  by an actual button click ... never by the LLM asserting in its own
+  response text that a human confirmed something."* No new plumbing was
+  needed for that guarantee — Phase 7 already built it generically for any
+  `requires_confirmation` tool.
+- `main.py`'s `_on_confirmation_requested` gained one small addition,
+  `_confirmation_prompt()`, which special-cases `send_email` into a
+  readable To/Subject/Body preview instead of the generic
+  comma-joined-`key=value` dialog every other confirmation-gated tool
+  still uses — a multi-paragraph email body squashed onto one line would
+  be unreadable exactly when readability matters most (the human's one
+  chance to catch a bad address or a bad draft before anything sends).
+- Not wired up: the plan's "once working, wire it into Phase 7's reminder
+  scheduler so due reminders can optionally email too" step. That
+  scheduler (APScheduler `BackgroundScheduler` polling `reminders.py`,
+  triggering an OS notification) doesn't exist in this codebase yet — see
+  the ordering note at the top of this README. `send_email` today only
+  fires from a normal chat turn ("email Priya that I'll be late"), not
+  from a background reminder trigger.
+
+## What's next (Phase 9+)
+
+Whatever the plan's later phases call for beyond email — RAG (Phase 9),
+system control (Phase 10), and beyond — plus the still-outstanding
+reminder-scheduler half of Phase 7 noted above.

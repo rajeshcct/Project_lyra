@@ -35,10 +35,11 @@ import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable, Optional
 
-DB_PATH = Path(__file__).resolve().parent.parent / "lyra_memory.db"
+from .paths import PROJECT_ROOT
+
+DB_PATH = PROJECT_ROOT / "lyra_memory.db"
 
 # One id per process run. The Phase 3 checkpoint only requires remembering
 # a name *within* a session -- but persisting it in `users` also makes it
@@ -68,7 +69,7 @@ _PREFERENCE_PATTERNS = [
 # Rolling-summary tuning. Kept small on purpose — this is a hobby desktop
 # app talking to free-tier models, not a product with a token budget to
 # spare.
-RECENT_TURNS_KEPT = 8  # most recent chat_history rows always sent verbatim
+RECENT_TURNS_KEPT = 4  # most recent chat_history rows always sent verbatim
 SUMMARY_BATCH_SIZE = 10  # how many old rows get folded into the summary at once
 MAX_PREFERENCES = 20  # oldest preferences fall off past this so the list stays short
 
@@ -214,6 +215,22 @@ def log_message(role: str, content: str) -> None:
         )
 
 
+def get_recent_commands(limit: int = 15) -> list[dict]:
+    """Phase 11 -- the most recent `limit` USER-authored turns across every
+    session, most recent first. Deliberately separate from
+    get_recent_turns() below: that one stays reserved for prompt-context
+    (both roles, oldest-first, capped at RECENT_TURNS_KEPT) so widening or
+    narrowing the dashboard's "recent commands" list never touches what
+    actually gets sent to the model."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT content, timestamp FROM chat_history WHERE role = 'user' "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [{"content": content, "timestamp": timestamp} for content, timestamp in rows]
+
+
 def get_recent_turns(limit: int = RECENT_TURNS_KEPT) -> list[tuple[str, str]]:
     """The most recent `limit` (role, content) rows, oldest first — this is
     what gets sent to the model verbatim on every turn, regardless of
@@ -296,6 +313,47 @@ def maybe_condense_history(summarize: Callable[[str], str]) -> None:
             [(i,) for i in ids],
         )
     set_summary(new_summary)
+
+
+def get_session_turns(limit: int = RECENT_TURNS_KEPT) -> list[dict]:
+    """The most recent `limit` turns from the CURRENT session only, oldest
+    first, as [{"role": "user", "content": "..."}, ...].  Used to build
+    real alternating user/assistant messages instead of a flat text block."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT role, content FROM chat_history "
+            "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (SESSION_ID, limit),
+        ).fetchall()
+    return [{"role": role, "content": content} for role, content in reversed(rows)]
+
+
+def build_persistent_context() -> str:
+    """Name + preferences + rolling summary — persistent facts only, formatted
+    for injection into the system prompt.  No verbatim turns (those go as
+    real history messages now)."""
+    parts = []
+
+    name = get_user_name()
+    if name:
+        parts.append(f"The user's name is {name}.")
+
+    prefs = get_preferences()
+    if prefs:
+        parts.append("Known preferences: " + "; ".join(prefs) + ".")
+
+    summary = get_summary()
+    if summary:
+        parts.append("Summary of the conversation so far: " + summary)
+
+    if not parts:
+        return ""
+
+    return (
+        "\n".join(parts)
+        + "\nAddress the user by name when it feels natural, but don't force "
+        "it into every reply."
+    )
 
 
 def build_memory_prefix() -> str:

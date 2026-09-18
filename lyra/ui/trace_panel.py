@@ -67,7 +67,11 @@ class ReasoningTracePanel(QFrame):
         line.setWordWrap(True)
         line.setTextFormat(Qt.PlainText)
         line.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        color = ERROR if event.get("type") in ("tool_error", "tool_blocked", "round_limit") else TEXT_DIM
+        color = (
+            ERROR
+            if event.get("type") in ("tool_error", "tool_blocked", "tool_denied", "round_limit")
+            else TEXT_DIM
+        )
         line.setStyleSheet(
             f"color: {color.name()}; font-size: 11px; background: transparent; border: none;"
         )
@@ -87,6 +91,12 @@ class ReasoningTracePanel(QFrame):
             return f"    \u2717 {name} failed: {event.get('error', '')}"
         if etype == "tool_blocked":
             return f"    \u26d4 {name} needs confirmation \u2014 not run"
+        if etype == "tool_confirmation_requested":
+            return f"    \u23f8 waiting for you to approve {name}..."
+        if etype == "tool_confirmed":
+            return f"    \u2714 {name} approved \u2014 running"
+        if etype == "tool_denied":
+            return f"    \u2717 {name} declined \u2014 not run"
         if etype == "round_limit":
             rounds = event.get("rounds", "?")
             return f"    \u23f9 hit the {rounds}-round tool limit \u2014 answering with what's gathered so far"

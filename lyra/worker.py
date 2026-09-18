@@ -12,6 +12,8 @@ Gemini, or whatever gets added next — that's the whole point of the
 provider abstraction in providers/.
 """
 
+import threading
+
 from PySide6.QtCore import QThread, Signal
 
 from .llm_client import ask_llm_stream, ask_llm_with_tools
@@ -70,19 +72,61 @@ class ToolWorker(QThread):
     chunk_ready = Signal(str)
     reply_ready = Signal(str)
     error_occurred = Signal(str)
+    # Phase 7 -- emitted from this (background) thread, auto-queued by Qt
+    # onto the main thread same as tool_event/chunk_ready above. Carries
+    # (tool_name, args) for a tool with ToolSpec.requires_confirmation set;
+    # main.py's slot shows a dialog and calls provide_confirmation() with
+    # the human's answer, which is what actually unblocks run() below.
+    confirmation_requested = Signal(str, dict)
 
     def __init__(self, prompt: str, parent=None):
         super().__init__(parent)
         self._prompt = prompt
         self._cancelled = False
+        # Phase 7 -- confirmation bridge. _on_confirmation_required() below
+        # runs on THIS (background) thread inside ask_llm_with_tools and must
+        # block until a human answers; a plain Python threading.Event (not a
+        # Qt primitive) is what it waits on, since Qt signals themselves
+        # don't have a synchronous "wait for the slot's return value" mode
+        # across threads -- the slot in main.py answers by calling
+        # provide_confirmation(), which stashes the result and sets the event.
+        self._confirmation_event = threading.Event()
+        self._confirmation_result = False
 
     def cancel(self):
         """Ask the in-flight request to stop at the next streamed chunk.
         Cooperative, not forced: run() keeps executing until
         ask_llm_with_tools notices should_cancel() and returns, so this
         never leaves the underlying HTTP stream/connection in a half-torn
-        state the way QThread.terminate() would."""
+        state the way QThread.terminate() would. Also unblocks a pending
+        confirmation wait (treated as a decline) so Stop can't be swallowed
+        by a dialog nobody answers."""
         self._cancelled = True
+        self._confirmation_result = False
+        self._confirmation_event.set()
+
+    def provide_confirmation(self, approved: bool):
+        """Called from the MAIN thread (main.py's dialog slot) once the user
+        has answered. Unblocks whichever _on_confirmation_required() call is
+        currently waiting in run()'s thread."""
+        self._confirmation_result = approved
+        self._confirmation_event.set()
+
+    def _on_confirmation_required(self, tool_name: str, args: dict) -> bool:
+        """Passed to ask_llm_with_tools as on_confirmation_required. Runs on
+        this QThread, not the GUI thread -- emitting a signal here is safe
+        and gets auto-queued to the main thread's event loop (Qt's default
+        AutoConnection), but the return value has to come back some other
+        way, hence the Event/provide_confirmation() pair above."""
+        self._confirmation_event.clear()
+        self.confirmation_requested.emit(tool_name, args)
+        # Poll instead of a bare wait() so an in-flight cancel() (set from
+        # the main thread while a dialog is up) is noticed promptly rather
+        # than only after the user eventually answers.
+        while not self._confirmation_event.wait(timeout=0.2):
+            if self._cancelled:
+                return False
+        return self._confirmation_result
 
     def run(self):
         try:
@@ -91,6 +135,7 @@ class ToolWorker(QThread):
                 on_tool_event=self.tool_event.emit,
                 on_chunk=self.chunk_ready.emit,
                 should_cancel=lambda: self._cancelled,
+                on_confirmation_required=self._on_confirmation_required,
             )
             self.reply_ready.emit(reply)
         except RuntimeError as e:

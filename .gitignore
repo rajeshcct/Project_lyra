@@ -1,5 +1,7 @@
 # Environment / secrets
 .env
+credentials.json
+token.json
 
 # Virtual environment
 venv/
@@ -14,6 +16,17 @@ __pycache__/
 # Databases (added in later phases)
 *.db
 *.sqlite3
+
+# Phase 9 -- local vector store (embeddings of whatever the user uploads,
+# regenerable from the source files -- no reason to commit it)
+rag_store/
+
+# Phase 10 -- screenshots taken by take_screenshot(), local output only
+assets/screenshots/
+
+# Phase 13 -- PyInstaller build output (regenerable from source + lyra.spec)
+build/
+dist/
 
 # OS / editor cruft
 .DS_Store

@@ -76,9 +76,10 @@ def ask_llm(prompt: str) -> str:
     provider = get_provider(PROVIDER, api_key=API_KEY, model_name=MODEL_NAME)
     _extract_facts(prompt)
 
-    full_prompt = memory.build_memory_prefix() + prompt
+    memory_context = memory.build_persistent_context()
+    session_history = memory.get_session_turns()
     _log_user_turn_and_condense(prompt, provider)
-    reply = provider.ask(full_prompt)
+    reply = provider.ask(prompt, memory_context=memory_context, history=session_history)
 
     memory.log_message("assistant", reply)
     return reply
@@ -101,11 +102,12 @@ def ask_llm_stream(prompt: str):
     provider = get_provider(PROVIDER, api_key=API_KEY, model_name=MODEL_NAME)
     _extract_facts(prompt)
 
-    full_prompt = memory.build_memory_prefix() + prompt
+    memory_context = memory.build_persistent_context()
+    session_history = memory.get_session_turns()
     _log_user_turn_and_condense(prompt, provider)
 
     reply_chunks = []
-    for chunk in provider.ask_stream(full_prompt):
+    for chunk in provider.ask_stream(prompt, memory_context=memory_context, history=session_history):
         reply_chunks.append(chunk)
         yield chunk
 
@@ -117,6 +119,7 @@ def ask_llm_with_tools(
     on_tool_event: Optional[ToolEventCallback] = None,
     on_chunk: Optional[Callable[[str], None]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    on_confirmation_required: Optional[Callable[[str, dict], bool]] = None,
 ) -> str:
     """
     Phase 4 — same shape and memory handling as ask_llm(), but gives the
@@ -136,6 +139,13 @@ def ask_llm_with_tools(
     on_chunk to a Qt signal so the UI can grow the reply bubble live instead
     of waiting for the whole answer, and should_cancel to a Stop button.
 
+    `on_confirmation_required`, if given, is forwarded straight to the
+    provider too — Phase 7's human-in-the-loop hook for tools with
+    ToolSpec.requires_confirmation set (see LLMProvider.ask_with_tools's
+    docstring for the exact contract). worker.py wires this to a
+    threading.Event bridge so the blocking call lands on the GUI thread as
+    an actual confirm/deny dialog (main.py's _on_confirmation_requested).
+
     Same RuntimeError contract as ask_llm: callers only ever need to catch
     RuntimeError, never a raw SDK exception.
     """
@@ -145,15 +155,19 @@ def ask_llm_with_tools(
     provider = get_provider(PROVIDER, api_key=API_KEY, model_name=MODEL_NAME)
     _extract_facts(prompt)
 
-    full_prompt = memory.build_memory_prefix() + prompt
+    memory_context = memory.build_persistent_context()
+    session_history = memory.get_session_turns()
     _log_user_turn_and_condense(prompt, provider)
     reply = provider.ask_with_tools(
-        full_prompt,
+        prompt,
         tools=get_all_tools(),
         system_instruction=TOOL_SAFETY_SYSTEM_PROMPT,
         on_tool_event=on_tool_event,
         on_chunk=on_chunk,
         should_cancel=should_cancel,
+        memory_context=memory_context,
+        history=session_history,
+        on_confirmation_required=on_confirmation_required,
     )
 
     memory.log_message("assistant", reply)

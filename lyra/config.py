@@ -10,7 +10,14 @@ Supported providers: "gemini", "groq"
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+from .paths import PROJECT_ROOT
+
+# Phase 13 -- explicit path rather than load_dotenv()'s default cwd-upward
+# search. Double-clicking a packaged .exe doesn't guarantee the working
+# directory is the folder the .exe (and its .env) actually sit in, so the
+# default search could silently miss it. PROJECT_ROOT (lyra/paths.py) is
+# always "next to the .exe" when frozen, "the project folder" from source.
+load_dotenv(PROJECT_ROOT / ".env")
 
 # Which provider to use. Override via .env: LLM_PROVIDER=gemini or LLM_PROVIDER=groq
 PROVIDER = os.environ.get("LLM_PROVIDER", "groq").strip().lower()

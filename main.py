@@ -25,6 +25,12 @@ a turn is in flight, and the final answer itself streams in token-by-token
 into its own bubble via ToolWorker.chunk_ready, exactly like the plain
 non-tool path -- only the tool-decision step has no text to stream.
 
+Phase 11 adds a read-only dashboard on top of everything above: a toggle
+button (\U0001F4CA) shows/hides lyra/ui/dashboard_panel.py, which polls
+reminders.py's SQLite table, memory.py's chat_history, and rag.py's
+Chroma store on a timer -- no new backend logic, purely a UI layer over
+data every earlier phase already collects.
+
 Visuals live in their own modules, same "swap without touching other
 files" principle as providers/:
     theme.py           - color palette + stylesheet (QSS)
@@ -41,6 +47,32 @@ for a calculation -> the reasoning-trace panel shows the calculator being
 called and its result before the final answer appears.
 """
 
+# --- Environment compatibility shim -- must run before ANY other import ---
+# `six` (a dependency of dateparser, and possibly vendored by other SDKs
+# this app uses) installs a meta path finder (_SixMetaPathImporter) into
+# sys.meta_path so `six.moves.*` submodules import correctly. On this
+# environment (Python 3.12 + this six version), something later in the
+# import chain ends up doing getattr(<that importer instance>, "_path"),
+# which raises AttributeError because that attribute is never set on the
+# instance -- crashing app startup with:
+#     AttributeError: '_SixMetaPathImporter' object has no attribute '_path'
+# This is a known six / Python-3.12 importlib incompatibility, not
+# anything wrong in this project's own code. Rather than requiring an
+# environment fix (upgrading/reinstalling `six`), this patches a
+# class-level fallback for `_path` the moment `six` is first imported
+# ANYWHERE in the process -- so later `getattr(importer, "_path")` calls
+# fall back to this instead of raising, no matter which import first
+# triggers them. Must run before lyra.* imports below, since those are
+# what eventually pull in dateparser (-> six) via tools/reminder_tool.py.
+# Wrapped in try/except so it's a silent no-op wherever `six` isn't
+# installed or the bug doesn't apply.
+try:
+    import six as _six
+    if not hasattr(_six._SixMetaPathImporter, "_path"):
+        _six._SixMetaPathImporter._path = None
+except Exception:
+    pass
+
 import re
 import sys
 from collections import deque
@@ -52,7 +84,7 @@ from PySide6.QtCore import (
     QParallelAnimationGroup,
     QEasingCurve,
 )
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QWidget,
@@ -65,24 +97,35 @@ from PySide6.QtWidgets import (
     QPushButton,
     QLabel,
     QGraphicsDropShadowEffect,
+    QMessageBox,
+    QSystemTrayIcon,
+    QFileDialog,
 )
+
+from pathlib import Path
 
 from lyra.config import PROVIDER
 from lyra.worker import ToolWorker
 from lyra.mic_worker import MicWorker
 from lyra.tts_worker import TTSWorker
+from lyra.scheduler import ReminderScheduler
+from lyra.rag_worker import RagIngestWorker
 from lyra.ui.theme import QSS, ACCENT
 from lyra.ui.splash import SplashScreen
 from lyra.ui.hud_background import HudBackground
 from lyra.ui.chat_bubble import make_row
 from lyra.ui.trace_panel import ReasoningTracePanel
+from lyra.ui.dashboard_panel import DashboardPanel
+from lyra.paths import BUNDLE_ROOT
+
+ASSETS_DIR = BUNDLE_ROOT / "assets"
 
 
 class ChatWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Lyra — Phase 4 Chat ({PROVIDER})")
-        self.resize(720, 620)
+        self.setWindowTitle(f"Lyra — Phase 11 Chat ({PROVIDER})")
+        self.resize(720, 700)
 
         self._worker = None  # keep a reference so QThread isn't garbage collected mid-run
 
@@ -93,6 +136,7 @@ class ChatWindow(QWidget):
         # triggers unsolicited speech.
         self._mic_worker = None
         self._tts_worker = None
+        self._rag_worker = None  # Phase 9 -- keeps a reference so the ingest QThread isn't GC'd mid-run
         self._voice_turn = False
         self._hands_free = False  # True after mic button is toggled on -- keeps re-listening
         self._reply_text_full = ""  # last reply's full text, for TTS once it finishes
@@ -111,6 +155,66 @@ class ChatWindow(QWidget):
         self._reveal_timer.timeout.connect(self._reveal_next_word)
 
         self._build_ui()
+        self._init_tray_icon()
+        self._start_reminder_scheduler()
+
+    # -- Phase 7 -- reminder scheduler + system notifications ------------
+
+    def _init_tray_icon(self):
+        """System tray icon used purely for reminder notifications (Qt's
+        QSystemTrayIcon.showMessage needs an icon+tray to attach the popup
+        to, even though we never show a context menu). Reuses the splash
+        image rather than shipping a second asset."""
+        icon_path = ASSETS_DIR / "splash.png"
+        icon = QIcon(str(icon_path)) if icon_path.exists() else self.style().standardIcon(
+            self.style().StandardPixmap.SP_MessageBoxInformation
+        )
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setToolTip("Lyra")
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.show()
+
+    def _start_reminder_scheduler(self):
+        """Wires lyra/scheduler.py's ReminderScheduler into the running app.
+        Backend (polling, email sending) already existed -- this is the
+        missing GUI-side half: turn its signals into an actual system
+        notification / transcript line, and start/stop it with the app."""
+        self._reminder_scheduler = ReminderScheduler(self)
+        self._reminder_scheduler.reminder_due.connect(self._on_reminder_due)
+        self._reminder_scheduler.reminder_email_sent.connect(self._on_reminder_email_sent)
+        self._reminder_scheduler.reminder_email_failed.connect(self._on_reminder_email_failed)
+        try:
+            self._reminder_scheduler.start()
+        except RuntimeError as e:
+            # Missing APScheduler -- app still runs fine, reminders just
+            # won't self-fire until the dependency is installed (see
+            # scheduler.py's module docstring).
+            self._append_line("System", str(e), is_error=True)
+
+    def _on_reminder_due(self, reminder: dict):
+        text = reminder["text"]
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray_icon.showMessage(
+                "Lyra reminder", text, QSystemTrayIcon.MessageIcon.Information, 10000
+            )
+        self._append_line("Lyra", f"\u23f0 Reminder: {text}")
+
+    def _on_reminder_email_sent(self, info: dict):
+        self._append_line("System", f"Reminder email sent to {info['email_to']}.")
+
+    def _on_reminder_email_failed(self, info: dict):
+        self._append_line(
+            "System",
+            f"Couldn't send reminder email to {info['email_to']}: {info['error']}",
+            is_error=True,
+        )
+
+    def closeEvent(self, event):
+        # Stop the background poller cleanly so it doesn't keep touching
+        # this window's Qt objects after Python starts tearing them down.
+        if getattr(self, "_reminder_scheduler", None) is not None:
+            self._reminder_scheduler.stop()
+        super().closeEvent(event)
 
     def _build_ui(self):
         # Layer 0: static HUD background (hud_background.py).
@@ -195,6 +299,14 @@ class ChatWindow(QWidget):
         self.trace_panel = ReasoningTracePanel()
         layout.addWidget(self.trace_panel)
 
+        # Phase 11 -- dashboard panel: read-only reminders/recent-commands/
+        # documents view over data earlier phases already collect. Hidden
+        # until the dashboard button below is toggled on, same "costs
+        # nothing until asked for" spirit as trace_panel starting hidden.
+        self.dashboard_panel = DashboardPanel()
+        self.dashboard_panel.hide()
+        layout.addWidget(self.dashboard_panel)
+
         input_row = QHBoxLayout()
 
         # Text input is the permanent fallback (Phase 3 adds voice on top of
@@ -226,6 +338,38 @@ class ChatWindow(QWidget):
         mic_glow.setOffset(0, 0)
         self.mic_button.setGraphicsEffect(mic_glow)
         input_row.addWidget(self.mic_button)
+
+        # Phase 9 -- upload button. Feeds lyra/rag.py via RagIngestWorker
+        # (background thread, same reasoning as mic/tts) rather than the
+        # tool-calling path -- the model has no business picking which file
+        # on disk gets indexed, that's a user action through a real file
+        # dialog, per the plan's "Person A builds upload UI" split.
+        self.upload_button = QPushButton("\U0001F4CE")
+        self.upload_button.setToolTip("Upload a PDF or text file for Lyra to search")
+        self.upload_button.setFixedWidth(44)
+        self.upload_button.clicked.connect(self._on_upload_clicked)
+        upload_glow = QGraphicsDropShadowEffect(self.upload_button)
+        upload_glow.setColor(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 130))
+        upload_glow.setBlurRadius(16)
+        upload_glow.setOffset(0, 0)
+        self.upload_button.setGraphicsEffect(upload_glow)
+        input_row.addWidget(self.upload_button)
+
+        # Phase 11 -- dashboard toggle. Shows/hides the read-only panel
+        # built above; DashboardPanel's own showEvent/hideEvent start and
+        # stop its refresh timer, so this button doesn't need to manage
+        # that itself.
+        self.dashboard_button = QPushButton("\U0001F4CA")
+        self.dashboard_button.setToolTip("Show/hide the dashboard (reminders, recent commands, documents)")
+        self.dashboard_button.setFixedWidth(44)
+        self.dashboard_button.setCheckable(True)
+        self.dashboard_button.clicked.connect(self._toggle_dashboard)
+        dashboard_glow = QGraphicsDropShadowEffect(self.dashboard_button)
+        dashboard_glow.setColor(QColor(ACCENT.red(), ACCENT.green(), ACCENT.blue(), 130))
+        dashboard_glow.setBlurRadius(16)
+        dashboard_glow.setOffset(0, 0)
+        self.dashboard_button.setGraphicsEffect(dashboard_glow)
+        input_row.addWidget(self.dashboard_button)
 
         # Stop button: only meaningful while a request is in flight, so it
         # starts hidden and _set_busy() toggles its visibility. Cancels the
@@ -271,6 +415,7 @@ class ChatWindow(QWidget):
         self._worker.chunk_ready.connect(self._on_chunk_ready)
         self._worker.reply_ready.connect(self._on_reply_ready)
         self._worker.error_occurred.connect(self._on_error)
+        self._worker.confirmation_requested.connect(self._on_confirmation_requested)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
 
@@ -325,6 +470,47 @@ class ChatWindow(QWidget):
             if self._hands_free:
                 self.start_listening()
 
+    # -- Phase 9 -- document upload (RAG) ---------------------------------
+
+    def _on_upload_clicked(self):
+        if self._rag_worker is not None:
+            return  # an ingest is already running -- ignore a repeat click
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Upload a document",
+            "",
+            "Documents (*.pdf *.txt *.md)",
+        )
+        if not path:
+            return  # dialog cancelled
+
+        self.upload_button.setEnabled(False)
+        self.status_label.setText("Indexing document...")
+        self._append_line("System", f"Indexing '{Path(path).name}'...")
+
+        self._rag_worker = RagIngestWorker(path)
+        self._rag_worker.done_ready.connect(self._on_rag_done)
+        self._rag_worker.error_occurred.connect(self._on_rag_error)
+        self._rag_worker.finished.connect(self._on_rag_finished)
+        self._rag_worker.start()
+
+    def _on_rag_done(self, summary: str):
+        self._append_line("System", summary)
+
+    def _on_rag_error(self, message: str):
+        self._append_line("System", message, is_error=True)
+
+    def _on_rag_finished(self):
+        self._rag_worker = None
+        self.upload_button.setEnabled(True)
+        self.status_label.setText("")
+
+    # -- Phase 11 -- dashboard ---------------------------------------------
+
+    def _toggle_dashboard(self, checked: bool):
+        self.dashboard_panel.setVisible(checked)
+
     def _on_chunk_ready(self, chunk: str):
         # Track the true full text immediately (memory/TTS need the real
         # content regardless of display pacing), but only feed the *visible*
@@ -376,6 +562,48 @@ class ChatWindow(QWidget):
 
     def _on_error(self, message: str):
         self._append_line("Error", message, is_error=True)
+
+    def _confirmation_prompt(self, tool_name: str, args: dict) -> str:
+        """Build the dialog body for a requires_confirmation tool call.
+        Phase 8 -- send_email gets a readable To/Subject/Body preview
+        instead of the generic key=value dump, since a multi-line body
+        squashed into one comma-joined line would be unreadable right when
+        readability matters most (this is the human's one chance to catch
+        a bad address or a hallucinated draft before anything real sends).
+        Every other confirmation-gated tool keeps the generic format."""
+        if tool_name == "send_email":
+            to = args.get("to", "")
+            subject = args.get("subject", "")
+            body = args.get("body", "")
+            return (
+                "Lyra wants to send this email:\n\n"
+                f"To: {to}\n"
+                f"Subject: {subject}\n\n"
+                f"{body}\n\n"
+                "Send it?"
+            )
+        args_preview = ", ".join(f"{k}={v!r}" for k, v in args.items()) or "(no arguments)"
+        return f"Lyra wants to run '{tool_name}' with:\n{args_preview}\n\nAllow this?"
+
+    def _on_confirmation_requested(self, tool_name: str, args: dict):
+        """Phase 7 -- ToolWorker.confirmation_requested lands here, on the
+        GUI thread (Qt auto-queues it), while the worker thread sits blocked
+        inside _on_confirmation_required() waiting on its threading.Event.
+        QMessageBox.question() below is itself blocking, which is exactly
+        right here -- the whole point is that nothing about this tool call
+        proceeds until a human has actually looked at it and clicked
+        something. Whatever the user picks is handed straight back to the
+        worker via provide_confirmation(), which sets that event."""
+        prompt_text = self._confirmation_prompt(tool_name, args)
+        answer = QMessageBox.question(
+            self,
+            "Confirm action",
+            prompt_text,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,  # default focus on No -- a sensitive action should never be a stray Enter-press
+        )
+        if self._worker is not None:
+            self._worker.provide_confirmation(answer == QMessageBox.Yes)
 
     def _on_worker_finished(self):
         if self._voice_turn and self._reply_text_full.strip():

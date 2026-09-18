@@ -9,3 +9,26 @@ pyttsx3>=2.90
 # Phase 5 tools
 requests>=2.32.0    # weather_tool.py (Open-Meteo)
 ddgs>=9.0.0         # websearch_tool.py (DuckDuckGo search, no API key)
+
+# Phase 8 tool
+google-api-python-client>=2.140.0   # Gmail API client (gmail_client.py)
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.1          # Desktop-app OAuth flow (InstalledAppFlow)
+
+# Phase 7 (scheduler half) -- reminders.py already imported dateparser
+# lazily before this was ever added here, so "in 10 minutes"-style times
+# silently failed to schedule anything until this dependency actually
+# existed. APScheduler is scheduler.py's background poller.
+dateparser>=1.2.0
+APScheduler>=3.10.4
+
+# Phase 9 (RAG)
+pypdf>=4.3.0                    # PDF text extraction
+sentence-transformers>=3.0.0    # local embeddings (all-MiniLM-L6-v2), free, no API key
+chromadb>=0.5.5                 # local persisted vector store
+
+# Phase 10 (system control)
+Pillow>=10.0.0                  # system_control_tool.py (take_screenshot via ImageGrab)
+
+# Phase 13 (packaging)
+pyinstaller>=6.10.0              # builds the standalone .exe (see lyra.spec, BUILD.md)

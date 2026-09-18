@@ -27,7 +27,7 @@ class LLMProvider(ABC):
         self.model_name = model_name
 
     @abstractmethod
-    def ask(self, prompt: str) -> str:
+    def ask(self, prompt: str, *, memory_context: str = "", history: list[dict] | None = None) -> str:
         """
         Send `prompt` to this provider and return the reply text.
 
@@ -39,7 +39,7 @@ class LLMProvider(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def ask_stream(self, prompt: str):
+    def ask_stream(self, prompt: str, *, memory_context: str = "", history: list[dict] | None = None):
         """
         Send `prompt` to this provider and yield reply text chunks as they
         arrive, instead of blocking for the full reply.
@@ -59,6 +59,9 @@ class LLMProvider(ABC):
         on_tool_event: Optional[ToolEventCallback] = None,
         on_chunk: Optional[Callable[[str], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        memory_context: str = "",
+        history: list[dict] | None = None,
+        on_confirmation_required: Optional[Callable[[str, dict], bool]] = None,
     ) -> str:
         """
         Send `prompt` to this provider with `tools` available for it to call,
@@ -100,6 +103,25 @@ class LLMProvider(ABC):
         instruction via this provider's native mechanism for that (not
         concatenated into the user prompt) — used for the tool-safety rule
         that tool results are data, never instructions to follow.
+
+        Phase 7 — `on_confirmation_required`, if given, is the human-in-
+        the-loop hook for ToolSpec.requires_confirmation tools (Security
+        rule #3 from the plan). Before running such a tool's func,
+        implementations call `on_confirmation_required(tool_name, args)` and
+        block on its return value: True runs the tool normally (emitting
+        tool_call/tool_result/tool_error via on_tool_event exactly like an
+        unconfirmed tool); False (or the callback raising) skips func and
+        feeds the model a short "user declined" string as that tool's
+        result instead, so it can still answer sensibly. Implementations
+        MUST emit a `{"type": "tool_confirmation_requested", "name": ...,
+        "args": ...}` on_tool_event immediately before calling it, so a UI
+        can show *why* the call is blocking. If no callback is given (e.g.
+        a CLI caller with no UI to ask), implementations fall back to
+        Phase 4/6's behavior: refuse and emit `tool_blocked` without running
+        anything — there's no safe way to get a human decision without one.
+        worker.py's ToolWorker is what actually supplies this callback for
+        the GUI, bridging the blocking call over to main.py's confirmation
+        dialog and back via a threading.Event.
 
         Same RuntimeError contract as ask()/ask_stream(): implementations
         MUST catch their SDK's own exceptions and re-raise as RuntimeError.

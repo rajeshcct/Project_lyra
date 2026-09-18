@@ -36,16 +36,28 @@ def _json_schema_to_gemini(schema: Any) -> Any:
 
 @register_provider("gemini")
 class GeminiProvider(LLMProvider):
-    def ask(self, prompt: str) -> str:
+    def ask(self, prompt: str, *, memory_context: str = "", history: list[dict] | None = None) -> str:
         from google import genai
+        from google.genai import types
         from google.genai import errors as genai_errors
 
         client = genai.Client(api_key=self.api_key)
 
+        contents = []
+        for turn in (history or []):
+            role = "user" if turn["role"] == "user" else "model"
+            contents.append(types.Content(role=role, parts=[types.Part(text=turn["content"])]))
+        contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
+
+        config = None
+        if memory_context:
+            config = types.GenerateContentConfig(system_instruction=memory_context)
+
         try:
             response = client.models.generate_content(
                 model=self.model_name,
-                contents=prompt,
+                contents=contents,
+                config=config,
             )
         except genai_errors.ClientError as e:
             if getattr(e, "code", None) == 429:
@@ -67,16 +79,28 @@ class GeminiProvider(LLMProvider):
             raise RuntimeError("Gemini returned an empty response.")
         return text
 
-    def ask_stream(self, prompt: str):
+    def ask_stream(self, prompt: str, *, memory_context: str = "", history: list[dict] | None = None):
         from google import genai
+        from google.genai import types
         from google.genai import errors as genai_errors
 
         client = genai.Client(api_key=self.api_key)
 
+        contents = []
+        for turn in (history or []):
+            role = "user" if turn["role"] == "user" else "model"
+            contents.append(types.Content(role=role, parts=[types.Part(text=turn["content"])]))
+        contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
+
+        config = None
+        if memory_context:
+            config = types.GenerateContentConfig(system_instruction=memory_context)
+
         try:
             stream = client.models.generate_content_stream(
                 model=self.model_name,
-                contents=prompt,
+                contents=contents,
+                config=config,
             )
             got_any = False
             for chunk in stream:
@@ -111,6 +135,9 @@ class GeminiProvider(LLMProvider):
         on_tool_event: Optional[ToolEventCallback] = None,
         on_chunk: Optional[Callable[[str], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        memory_context: str = "",
+        history: list[dict] | None = None,
+        on_confirmation_required: Optional[Callable[[str, dict], bool]] = None,
     ) -> str:
         from google import genai
         from google.genai import types
@@ -133,9 +160,10 @@ class GeminiProvider(LLMProvider):
         # requires_confirmation guard below) instead of letting the SDK
         # auto-call a plain Python function on the model's behalf.
         _afc_disabled = types.AutomaticFunctionCallingConfig(disable=True)
+        combined_system = "\n\n".join(p for p in [system_instruction, memory_context] if p) or None
         config_with_tools = types.GenerateContentConfig(
             tools=gemini_tools,
-            system_instruction=system_instruction or None,
+            system_instruction=combined_system,
             automatic_function_calling=_afc_disabled,
         )
         # Phase 6: tools-off config used to force a final text answer once
@@ -143,11 +171,15 @@ class GeminiProvider(LLMProvider):
         # no separate tool_choice="none" flag the way Groq/OpenAI do, so the
         # way to stop it calling a function is to not offer any this round.
         config_no_tools = types.GenerateContentConfig(
-            system_instruction=system_instruction or None,
+            system_instruction=combined_system,
             automatic_function_calling=_afc_disabled,
         )
 
-        contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+        contents = []
+        for turn in (history or []):
+            gemini_role = "user" if turn["role"] == "user" else "model"
+            contents.append(types.Content(role=gemini_role, parts=[types.Part(text=turn["content"])]))
+        contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
 
         def _map_error(e: Exception) -> RuntimeError:
             if isinstance(e, genai_errors.ClientError):
@@ -209,6 +241,25 @@ class GeminiProvider(LLMProvider):
 
             return "".join(text_parts), function_calls, collected_parts
 
+        def _run_tool(tool, tool_name, args) -> str:
+            """Actually call tool.func(**args), emitting tool_result/tool_error
+            via on_tool_event. Shared by the plain (no-confirmation-needed)
+            path and the Phase 7 post-approval path so both end up running
+            the tool identically -- the only difference is what happens
+            *before* this is reached."""
+            try:
+                result_text = tool.func(**args)
+            except Exception as e:
+                result_text = f"Error: {e}"
+                if on_tool_event:
+                    on_tool_event({"type": "tool_error", "name": tool_name, "error": str(e)})
+            else:
+                if on_tool_event:
+                    on_tool_event(
+                        {"type": "tool_result", "name": tool_name, "result": result_text}
+                    )
+            return result_text
+
         def _execute_function_calls(function_calls, collected_parts):
             """Run every call in `function_calls`, appending the model's turn
             and a function-response turn to `contents` in place. One round
@@ -239,36 +290,46 @@ class GeminiProvider(LLMProvider):
                     on_tool_event({"type": "tool_call", "name": tool_name, "args": args})
 
                 # Security rule #3: a sensitive tool never runs itself just
-                # because the model asked for it. No confirmation UI exists
-                # yet, so the safe default is to refuse and say so, rather
-                # than silently executing or silently ignoring the request.
+                # because the model asked for it. Phase 7: if a confirmation
+                # channel is wired up (on_confirmation_required -- worker.py
+                # supplies one for the GUI), block on the human's answer
+                # instead of refusing outright.
                 if tool.requires_confirmation:
-                    result_text = (
-                        f"Tool '{tool_name}' requires user confirmation before it "
-                        "can run, which isn't wired up yet — it was not executed."
-                    )
-                    if on_tool_event:
-                        on_tool_event(
-                            {"type": "tool_blocked", "name": tool_name, "args": args}
-                        )
-                else:
-                    try:
-                        result_text = tool.func(**args)
-                    except Exception as e:
-                        result_text = f"Error: {e}"
+                    if on_confirmation_required:
                         if on_tool_event:
                             on_tool_event(
-                                {"type": "tool_error", "name": tool_name, "error": str(e)}
+                                {"type": "tool_confirmation_requested", "name": tool_name, "args": args}
                             )
+                        try:
+                            approved = on_confirmation_required(tool_name, args)
+                        except Exception:
+                            approved = False
+                        if approved:
+                            if on_tool_event:
+                                on_tool_event(
+                                    {"type": "tool_confirmed", "name": tool_name, "args": args}
+                                )
+                            result_text = _run_tool(tool, tool_name, args)
+                        else:
+                            result_text = f"User declined to run tool '{tool_name}'."
+                            if on_tool_event:
+                                on_tool_event(
+                                    {"type": "tool_denied", "name": tool_name, "args": args}
+                                )
                     else:
+                        # No confirmation channel available (e.g. a
+                        # headless/CLI caller) -- same safe refusal as
+                        # Phase 4/6.
+                        result_text = (
+                            f"Tool '{tool_name}' requires user confirmation, but no "
+                            "confirmation UI is available in this context — it was not executed."
+                        )
                         if on_tool_event:
                             on_tool_event(
-                                {
-                                    "type": "tool_result",
-                                    "name": tool_name,
-                                    "result": result_text,
-                                }
+                                {"type": "tool_blocked", "name": tool_name, "args": args}
                             )
+                else:
+                    result_text = _run_tool(tool, tool_name, args)
 
                 function_response_parts.append(
                     types.Part.from_function_response(
